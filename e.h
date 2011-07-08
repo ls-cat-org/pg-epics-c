@@ -9,6 +9,11 @@
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <libpq-fe.h>
+
+// For some reason epics uses fixed length strings
+//
+#define MAX_STRING_SIZE 40
 
 typedef struct e_message_header {
   uint16_t cmd;
@@ -30,100 +35,29 @@ typedef struct e_extended_message_header {
   uint32_t dcount;
 } e_extended_message_header_t;
 
-
-
-
-// test channel names
-//
-typedef struct e_chan_struct {
-  char *chan_name;	// our name for this channel
-  unsigned char type;	// epics type: 0-7 for string, short, float, enum, char, long, double
-  unsigned short severity;
-  unsigned short status;
-  uint32_t timeStampSecs;
-  uint32_t timeStampNSecs;
-  char *units;
-  char **enum_list;
-  unsigned short nenums;
-
-  union {
-    char *string_value;
-    short short_value;
-    float  float_value;
-    unsigned short enum_value;
-    unsigned char char_value;
-    long long_value;
-    double double_value;
-  } current;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } upper_display;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } lower_display;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } upper_alarm;
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } upper_warning;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } lower_warning;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } lower_alarm;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } upper_control;
-
-  union {
-    short short_limit;
-    float float_limit;
-    unsigned char char_limit;
-    long long_limit;
-    double double_limit;
-  } lower_control;
-    
-} e_chan_t;
-
 // response packet
 //
 typedef struct e_response_struct {
-  int bufsize;		// number of bytes used in buf
-  char *buf;		// our buffer, free when done
+  struct sockaddr_in *peer;	// our peer
+  int bufsize;			// number of bytes used in buf
+  char *buf;			// our buffer, free when done
 } e_response_t;
+
+//
+// persistent socket information
+//
+typedef struct e_socks_buffer_struct {
+  char *host_name;	// read from host name command
+  char *user_name;	// read from user name command
+  void *buf;		// input buffer
+  int active;		// -1 when connection made; otherwise a count of active PV's served, 0 to close tcp connection
+  int bufsize;		// size of the buffer
+  char *rbp;		// pointer to the next position in the buffer to read from
+  char *wbp;		// pointer to the next position in the buffer to write to
+} e_socks_buffer_t;
+
+typedef struct e_dbr_size_struct {
+  char *dbr_name;
+  int  dbr_struct_size;
+  int  dbr_type_size;
+} e_dbr_size_t;
