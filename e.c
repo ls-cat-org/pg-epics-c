@@ -9,6 +9,8 @@ static int beacons;	// our beacon socket
 static struct sockaddr_in broadcastaddr, ouraddr;
 static int beacon_index;
 
+static int maybe_check_monitors = 0;	// a set value might have changed a monitor (TODO: have set return a parameter that says for sure if we need to check monitors)
+
 static PGconn *q = NULL;
 
 char* prepared_statements[] = {
@@ -1091,6 +1093,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;	        param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
     params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1104,6 +1107,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1120,6 +1124,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
       params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
       params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
       pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+      maybe_check_monitors = 1;
       if( pgr == NULL)
 	return;
       PQclear( pgr);
@@ -1134,6 +1139,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1147,6 +1153,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1160,6 +1167,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1173,6 +1181,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1620,6 +1629,7 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[0] = &nsid;	param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
     params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 1);
+    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
@@ -2390,6 +2400,10 @@ int main( int argc, char **argv) {
 	  ca_service( e_socks+i, e_sock_bufs+i);
 	}
       }
+    }
+    if( maybe_check_monitors) {
+      maybe_check_monitors = 0;
+      check_monitors();
     }
   }
   return 0;
