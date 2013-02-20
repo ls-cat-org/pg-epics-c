@@ -1,18 +1,29 @@
+/*! \file e.c
+ *  \brief LS-CAT postgres KV Pairs to EPICS connector
+ *  \date 2013
+ *  \author Keith Brister
+ *  \copyright All Rights Reserved
+ */
+
+
 #include "e.h"
 
-struct pollfd e_socks[1024];		// array of active sockets
-e_socks_buffer_t e_sock_bufs[1024];	// read buffer to support these sockets
-int n_e_socks = 0;
-int n_e_socks_max = sizeof( e_socks)/sizeof( e_socks[0]);
+struct pollfd e_socks[1024];					//!< array of active sockets
+e_socks_buffer_t e_sock_bufs[1024];				//!< read buffer to support these sockets
+int n_e_socks = 0;						//!< current number of sockets
+int n_e_socks_max = sizeof( e_socks)/sizeof( e_socks[0]);	//!< maximum number of sockets
 
-static int beacons;	// our beacon socket
-static struct sockaddr_in broadcastaddr, ouraddr;
-static int beacon_index;
+static int beacons;						//!< our beacon socket
+static struct sockaddr_in broadcastaddr, ouraddr;		//!< addresses for broadcasts and listening
+static int beacon_index;					//!< the index of the beacon socket in the socket array
 
-static int maybe_check_monitors = 0;	// a set value might have changed a monitor (TODO: have set return a parameter that says for sure if we need to check monitors)
+static int maybe_check_monitors = 0;	//!< a set value might have changed a monitor (TODO: have set return a parameter that says for sure if we need to check monitors)
 
-static PGconn *q = NULL;
+static PGconn *q = NULL;					//!< Our connection to the postgresql server
 
+/** List of statements we'll be calling
+ *  saved as prepared statements on the server to cut execution time
+ */
 char* prepared_statements[] = {
   "prepare beacon_update (inet, int) as select e.beacon_update($1,$2)",
   "prepare channel_search (inet,int,text) as select e.channel_search($1,$2,$3)",
@@ -26,6 +37,9 @@ char* prepared_statements[] = {
   "prepare remove_monitor (int) as select e.remove_monitor( $1)"
 };
 
+/** List of sizes for the various dbr types.
+ *  dbr name, structure size, type size
+ */
 e_dbr_size_t dbr_sizes[] = {
   //
   // Keep in order!!
@@ -67,7 +81,11 @@ e_dbr_size_t dbr_sizes[] = {
   { "crtl_double", 80, 8}
 };
 
-void hex_dump( int n, unsigned char *s) {
+/** Debugging packet helper
+ *  \param n  Number of characters to spew
+ *  \param s  The buffer to disgorge
+ */
+void hex_dump( int n, char *s) {
   int i,j;
   
 
@@ -84,7 +102,8 @@ void hex_dump( int n, unsigned char *s) {
 }
 
 
-
+/** Initialize the socket buffer for the given socket
+ */
 int e_socks_buf_init( int sock) {
   int i;
 
@@ -121,6 +140,8 @@ int e_socks_buf_init( int sock) {
   return i;
 }
 
+/** Connect to our database server
+ */
 void pg_conn() {
   PGresult *pgr;
   int wait_interval = 1;
@@ -182,6 +203,16 @@ void pg_conn() {
   }
 }
 
+/** execute a prepared sql statement
+ *  A wrapper for PQexePrepared
+ *  See http://www.postgresql.org/docs/8.4/static/libpq-exec.html
+ *
+ *  \param ps           The prepared statement
+ *  \param nParams      Number of parameters
+ *  \param params       Our array of parameters
+ *  \param paramLengths Array of parameter lengths (array can be null if there are no binary formats)
+ *  \param paramFormats Array of formats (0 = text, 1 = binary)
+ */
 PGresult *e_execPrepared( char *ps, int nParams, const char **params, const int *paramLengths, const int *paramFormats, int resultFormat) {
   PGresult *pgr;
 
@@ -197,9 +228,11 @@ PGresult *e_execPrepared( char *ps, int nParams, const char **params, const int 
 }
 
 
-// swap double to put in into network byte order
-// from http://www.dmh2000.com/cpp/dswap.shtml
-//
+/** swap double to put in into network byte order
+ * from http://www.dmh2000.com/cpp/dswap.shtml
+ *
+ * \param d the double value to scramble
+ */
 unsigned long long  swapd(double d) {
   unsigned long long a;
   unsigned char *dst = (unsigned char *)&a;
@@ -217,6 +250,10 @@ unsigned long long  swapd(double d) {
   return a;
 }
 
+/** The inverse of swapd
+ *
+ * \param a The value to unscramble
+ */
 double unswapd( long long a) {
   double d;
   unsigned char *dst = (unsigned char *)&d;
@@ -234,10 +271,12 @@ double unswapd( long long a) {
   return d;
 }
 
-// see if this is an extended header
-// not used for every command type
-//
-int get_header_type( unsigned char  *buf) {
+/** see if this is an extended header
+ * not used for every command type
+ *
+ * \param buf The header to check
+ */
+int get_header_type( char  *buf) {
   // return 1 if extended header, 0 if normal header
   if( *(buf+2)==0xff && *(buf+3)==0xff && *(buf+6)==0 && *(buf+7)==0) {
     return 1;
@@ -245,10 +284,12 @@ int get_header_type( unsigned char  *buf) {
   return 0;
 }
 
-// return just the command, not the entire header
-// Used to avoid supporting the header type for commands
-// that never, ever, use an extended header.
-//
+/** return just the command, not the entire header
+ * Used to avoid supporting the header type for commands
+ * that never, ever, use an extended header.
+ *
+ * \param buf the header to use
+ */
 uint16_t get_command( void *buf) {
   uint16_t tmp;
   memcpy( &tmp, buf, sizeof( uint16_t));
@@ -256,6 +297,16 @@ uint16_t get_command( void *buf) {
 }
 
 
+/** stuff the message header with the correct endian version of the parameters
+ *
+ * \param mh     pointer to the header to use
+ * \param cmd    the command
+ * \param plsize payload size
+ * \param dtype  data type
+ * \param dcount data item count
+ * \param p1     Parameter 1
+ * \param p2     Parameter 2
+ */
 void create_message_header( e_message_header_t *mh, uint16_t cmd, uint16_t plsize, uint16_t dtype, uint16_t dcount, uint32_t p1, uint32_t p2) {
   mh->cmd    = htons( cmd);
   mh->plsize = htons( plsize);
@@ -265,6 +316,16 @@ void create_message_header( e_message_header_t *mh, uint16_t cmd, uint16_t plsiz
   mh->p2     = htonl( p2);
 }
 
+/** set up an extended message header
+ *
+ * \param emh    Our extended message header
+ * \param cmd    The command
+ * \param plsize Payload size
+ * \param dtype  Data type
+ * \param dcount Number of data items
+ * \param p1     Parameter 1
+ * \param p2     Parameter 2
+ */
 void create_extended_message_header( e_extended_message_header_t *emh, uint16_t cmd, uint32_t plsize, uint16_t dtype, uint32_t dcount, uint32_t p1, uint32_t p2) {
   emh->cmd     = htons( cmd);
   emh->marker1 = 0xffff;
@@ -276,11 +337,20 @@ void create_extended_message_header( e_extended_message_header_t *emh, uint16_t 
   emh->dcount  = htons( dcount);
 }
 
-//
-// Creates a message using either the normal message header or the extended message header, as appropriate.
-// Calloc's room for the entire payload and returns a pointer to start of the payload memory.
-// r is a pointer to the response structure
-//
+
+/** Creates a message using either the normal message header or the extended message header, as appropriate.
+ *  Calloc's room for the entire payload and returns a pointer to start of the payload memory.
+ *
+ * Returns pointer to the payload data
+ *
+ * \param r pointer to the response structure
+ * \param cmd      the command
+ * \param pllength Payload length
+ * \param dtype    type of the data
+ * \param dcount   number of data items
+ * \param p1       parameter 1
+ * \param p2       parameter 2
+ */
 void *create_message( e_response_t *r, uint16_t cmd, uint32_t pllength, uint16_t dtype, uint32_t dcount, uint32_t p1, uint32_t p2) {
   uint32_t plsize;
   void *rtn;
@@ -301,7 +371,7 @@ void *create_message( e_response_t *r, uint16_t cmd, uint32_t pllength, uint16_t
     r->buf = calloc( r->bufsize, 1);
     if( r->buf == NULL) {
       fprintf( stderr, "Out of memory (create_message)\n");
-      return;
+      return NULL;
     }
 
     create_extended_message_header( (e_extended_message_header_t *) r->buf, cmd, plsize, dtype, dcount, p1, p2);
@@ -313,7 +383,7 @@ void *create_message( e_response_t *r, uint16_t cmd, uint32_t pllength, uint16_t
     r->buf = calloc( r->bufsize, 1);
     if( r->buf == NULL) {
       fprintf( stderr, "Out of memory (create_message)\n");
-      return;
+      return NULL;
     }
     
     create_message_header( (e_message_header_t *) r->buf, cmd, plsize, dtype, dcount, p1, p2);
@@ -325,6 +395,19 @@ void *create_message( e_response_t *r, uint16_t cmd, uint32_t pllength, uint16_t
   return rtn;
 }
 
+
+/** Set up a dbr structure
+ *  Basically fills in a structure by "hand"
+ *
+ * \param pp           Pointer to the space reserved for this structure
+ * \param dtype        The type of the structure
+ * \param eepoch       Our timestamp
+ * \param highlimit    High limit value
+ * \param lowlimit     Low limit value
+ * \param highlimithit Indicates the high limit has been reached
+ * \param lowlimithit  Indicates the low limit has been reached
+ * \param prec         The precision of the value contained in this packet
+ */
 void mk_dbr_struct( void *pp, int dtype, uint32_t eepoch, uint32_t ensec, char *highlimit, char *lowlimit, int highlimithit, int lowlimithit, int prec) {
   struct timeval tv;
   struct timezone tz;
@@ -722,6 +805,12 @@ void mk_dbr_struct( void *pp, int dtype, uint32_t eepoch, uint32_t ensec, char *
   }
 }
 
+/** put the datavalue in the packet
+ *
+ * \param pp     Our packet
+ * \param dtype  The data type
+ * \param svalue The value to store in the packet
+ */
 void pack_dbr_data( void *pp, int dtype, char *svalue) {
   int16_t short_value;
   int32_t int_value, int_value2;
@@ -778,10 +867,11 @@ void pack_dbr_data( void *pp, int dtype, char *svalue) {
 }
 
 
-// pgr result from get_values query
-// dbr_type is the request return type
-// count is the requested count.  If count==0, use the actual return count
-//
+/**
+ * \param pgr      result from get_values query
+ * \param dbr_type the request return type
+ * \param count    the requested count.  If count==0, use the actual return count
+ */
 void format_dbr( PGresult *pgr, e_response_t *r, int cmd, int dtype, uint32_t dcount, uint32_t p1, uint32_t p2) {
   int
     i,				// loop over query results
@@ -883,8 +973,12 @@ void format_dbr( PGresult *pgr, e_response_t *r, int cmd, int dtype, uint32_t dc
 }
 
 
-// normal header: meaning of fields is command dependent (should be a union, perhaps)
-//
+/** Convert a header into our native byte order
+ * normal header: meaning of fields is command dependent (should be a union, perhaps)
+ *
+ * \param inbuf  The incoming buffer to convert
+ * \param h      The outgoing buffer to return
+ */
 void read_message_header( e_socks_buffer_t *inbuf, e_message_header_t *h) {
   memcpy( h, inbuf->rbp, sizeof( struct e_message_header));
   inbuf->rbp += sizeof( struct e_message_header);
@@ -897,10 +991,15 @@ void read_message_header( e_socks_buffer_t *inbuf, e_message_header_t *h) {
   h->p2     = ntohl( h->p2);
 }
 
-// extended header: meaning of fields is command dependent (haha)
-// converts a regular header into an extended header so other functions do
-// not need to support both
-//
+/** Convert an extended header to native byte order
+ * extended header: meaning of fields is command dependent
+ *
+ * This routine converts a regular header into an extended header so other functions
+ * need only support an extended header
+ *
+ * \param inbuf  The incomming buffer to conver
+ * \param h      The buffer to return
+ */
 void read_extended_message_header( e_socks_buffer_t *inbuf, e_extended_message_header_t *h) {
   struct e_message_header mh;
 
@@ -931,8 +1030,20 @@ void read_extended_message_header( e_socks_buffer_t *inbuf, e_extended_message_h
 
 
 
-// cmd 0
-// tcp and udp
+/** Exchange client and server protocol version numbers
+ *
+ *          cmd: 0
+ * payload size: 0
+ *     priority: Virtual circuit priority
+ *      version: The version number
+ *     reserved: "must be zero" is specified but it appears to be a counter
+ *     reserved: "must be zero"
+ *
+ * tcp and udp
+ *
+ * \param inbuf  The buffer received
+ * \param r
+ */
 void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
   // 
   // Docs specify that this command does not request a response but our
@@ -950,8 +1061,20 @@ void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
 
 
 
-// cmd 1
-// tcp
+/** Creates a subscription on a channel
+ *
+ *            cmd:  1
+ *   payload size: 16
+ *      data type: desired dbr type
+ *     data count: desired number of elements (>=0)
+ *            SID: Our channel number
+ * subscriptionID: ID client uses to identify this subscription
+ *
+ * tcp
+ *
+ * \param inbuf The received buffer
+ * \param r     Our response
+ */
 void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
   uint32_t mask, nmask, nsid, ncount, nsubid, nsock, ndtype;
@@ -993,6 +1116,15 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   if( pgr == NULL)
     return;
 
+  // Response
+  //
+  //             cmd: 1
+  //    payload size: response size
+  //       data type: same as the request
+  //      data count: same as request
+  //     status code: ECA_NORMAL (1) on success
+  // Subscription ID: same as request
+  //
   format_dbr( pgr, r, 1, emh.dtype, emh.dcount, 1, emh.p2);
 
   PQclear( pgr);
@@ -1000,8 +1132,17 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Event add\n");
 }
 
-// cmd 2
-// tcp
+/** Clears event subscription
+ *
+ *            cmd: 2
+ *   payload size: 0
+ *      data type: Same value sent in the subscribe request (do we check this?)
+ *     data count: Same value sent in the subscribe request (Again, do we check this?)
+ *            SID: Our channel number
+ * SubscriptionID: The client's subscriptino ID
+ *
+ * tcp
+ */
 void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
   uint32_t nsid, nsubid;
@@ -1031,11 +1172,12 @@ void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
 
 }
 
-// cmd 3
-// tcp
-// Deprecated
-// Not supported here
-//
+/** (depreceitated, unsupported here) Read the value of a chennel
+ * cmd 3
+ * tcp
+ * Deprecated
+ * Not supported here
+ */
 void cmd_ca_proto_read( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1045,8 +1187,17 @@ void cmd_ca_proto_read( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->rbp += emh.plsize;
 }
 
-// cmd 4
-// tcp
+/** Write a new channel value
+ *
+ *          cmd: 4
+ * payload size: size of dbr formatted data
+ *    data type: dbr type of the data
+ *   data count: number of elemets
+ *          SID: server channel identifier
+ *         IOID: client's identifer of this request
+ *
+ * tcp
+ */
 void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
   char *payload;
@@ -1193,11 +1344,12 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->rbp += emh.plsize;
 }
 
-// cmd 5
-// tcp
-// obsolete
-// Not supported here
-//
+/** Obsolete function unsupported here
+ * cmd 5
+ * tcp
+ * obsolete
+ * Not supported here
+ */
 void cmd_ca_proto_snapshot( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1205,8 +1357,17 @@ void cmd_ca_proto_snapshot( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->rbp += emh.plsize;
 }
 
-// cmd 6
-// tcp and udp
+/** Searches for a given channel name
+ *
+ *          cmd: 6
+ * payload size: padded size of channel name
+ *        reply: 10 = don't reply on failed search, 5 = should reply on failed search
+ *      version: minor protocol version number
+ *          CID: client id number
+ * (docs specify that CID should be repeated in parameter 2, I'm not sure this is true)
+ *
+ * tcp and udp
+ */
 void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   int reply;
   int version, versionn;
@@ -1232,6 +1393,10 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   cid     = emh.p1;
 
   //fprintf( stderr, "Search: plsize = %d, version = %d, reply = %d, cid = %d, PV = '%s'\n", emh.plsize, version, reply, cid, pl);
+
+  if( strcmp( "thisIsTheEnd", pl) == 0) {
+    exit( 0);
+  }
 
   params[0] = inet_ntoa( r->peer.sin_addr);	paramLengths[0] = 0;                   paramFormats[0] = 0;
   params[1] = (char *)&versionn;                paramLengths[1] = sizeof( versionn);   paramFormats[1] = 1;
@@ -1259,7 +1424,16 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   if( foundIt) {
     uint16_t server_protocol_version = 11, *spvp;
 
-    spvp = create_message( r, 6, 2, 5064, 0, 0xffffffff, cid);
+    // Response
+    //
+    //          cmd: 6
+    // payload size: 8
+    //  port number: our port number (5064)
+    //   data count: 0
+    //          SID: 0xffffffff
+    //          CID: same as the request
+    //
+    spvp = create_message( r, 6, 8, 5064, 0, 0xffffffff, cid);
     *spvp = htons(server_protocol_version);
   }
 
@@ -1275,16 +1449,26 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
       fprintf( stderr, "Out of memory (cmd_ca_proto_search)\n");
       return;
     }
+    // Response
+    //
+    //          cmd: 14
+    // payload size:  0
+    //   reply flag:  DO_REPLY (aka 10)
+    //      version:  same as request
+    //          CID:  same as request
+    //          CID:  same as request
+    //
     create_message( r, 14, 0, 10, version, cid, cid);
   }
 }
 
 
-// cmd 7
-// tcp
-// obsolete
-// Not supported here
-//
+/** Documented only as being obsolete
+ * cmd 7
+ * tcp
+ * obsolete
+ * Not supported here
+ */
 void cmd_ca_proto_build( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1292,8 +1476,17 @@ void cmd_ca_proto_build( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->rbp += emh.plsize;
 }
 
-// cmd 8
-// tcp
+/** Disable server from sending subscription updates to this circuit
+ *
+ *          cmd: 8
+ * payload size: 0
+ *        dtype: 0
+ *       length: 0
+ *           p1: 0
+ *           p2: 0
+ *
+ * tcp
+ */
 void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   e_extended_message_header_t emh;
@@ -1301,11 +1494,20 @@ void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
   read_extended_message_header( inbuf, &emh);
   inbuf->rbp += emh.plsize;
   inbuf->events_on = 0;
-  //  printf( "Events off\n");
 }
 
-// cmd 9
-// tcp
+
+/** Enable server sending subscriptions updates to this circuit
+ *
+ *          cmd: 9
+ * payload size: 0
+ *        dtype: 0
+ *       length: 0
+ *           p1: 0
+ *           p2: 0
+ *
+ * tcp
+ */
 void cmd_ca_proto_events_on( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1315,11 +1517,13 @@ void cmd_ca_proto_events_on( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Events on\n");
 }
 
-// cmd 10
-// tcp
-// Deprecated
-// Not implemented here
-//
+/** Deprecated and un documented
+ *
+ * cmd 10
+ * tcp
+ * Deprecated
+ * Not implemented here
+ */
 void cmd_ca_proto_read_sync( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1328,12 +1532,19 @@ void cmd_ca_proto_read_sync( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Read Sync\n");
 }
 
-// cmd 11
-// tcp
-//
-// This command should be implemented when we act as a ca client
-// Not used as a server.
-//
+/** Sends error message and code
+ *
+ * cmd: 11
+ * payload size: Size of the request header that triggered the error plus size of the error message.
+ *     reserved: "must be zero"
+ *     reserved: "must be zero"
+ *          CID: Client's id for the failed channel
+ *  Status code: an ECA code
+ *
+ * tcp
+ *
+ * UNIMPLIMENTED
+ */
 void cmd_ca_proto_error( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1342,8 +1553,17 @@ void cmd_ca_proto_error( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Proto Error\n");
 }
 
-// cmd 12
-// tcp
+/** Clears the channel (shuts it down)
+ *
+ *           cmd: 12
+ *  payload size: 0
+ *     data type: 0
+ *   data length: 0
+ *           SID: Server's channel identifier
+ *           CID: Client's channel identifier
+ *
+ * tcp
+ */
 void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t sid, cid, sidn, cidn;
   e_extended_message_header_t emh;
@@ -1371,12 +1591,30 @@ void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   // The client does nothing with this message: it's just noise.
   //
+  // Response
+  //
+  //          cmd: 12
+  // payload size: 0
+  //    data type: 0
+  //  data length: 0
+  //          SID: server id (as sent to us)
+  //          CID: client id (as sent to us)
+  //
   create_message( r, 12, 0, 0, 0, sid, cid);
   inbuf->active--;
 }
 
-// cmd 13
-// udp
+/** Beacon sent by server when it becomes available
+ *
+ *             cmd: 13
+ *    payload size:  0
+ *     Server port:  TCP at which to find the server
+ *        reserved:  0
+ *       Beacon ID:  sequential beacon id
+ *         Address:  may contain the IP address of the server or may be zero
+ *
+ * udp
+ */
 void cmd_ca_proto_rsrv_is_up( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t beaconid, nbeaconid;
 
@@ -1408,12 +1646,22 @@ void cmd_ca_proto_rsrv_is_up( e_socks_buffer_t *inbuf, e_response_t *r) {
   // printf( "Beacon from %s with id %d\n", inet_ntoa( addr), beaconid);
 }
 
-// cmd 14
-// tcp and udp
-//
-// This command should be implemented when we support operations as a client.
-// As a server, this is possibly sent in response to a failed ca_proto_search request.
-//
+
+/** Indicates the requested channel does not exist
+ *  Currently unimplement as this is a response command and onlly
+ *  implemented in the client.
+ *
+ *            cmd: 14
+ * payload length:  0
+ *     reply flag: 10  (AKA DO_REPLY)
+ *        version: same as request
+ *            CID: same as request
+ *            CID: same as request
+ * tcp and udp
+ *
+ * This command should be implemented when we support operations as a client.
+ * As a server, this is possibly sent in response to a failed ca_proto_search request.
+ */
 void cmd_ca_proto_not_found( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1422,8 +1670,18 @@ void cmd_ca_proto_not_found( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Not Found\n");
 }
 
-// cmd 15
-// tcp
+
+/** Read the value of a channel
+ *
+ *          cmd: 15
+ * payload size:  0
+ *    data type: dbr type
+ *   data count: >= 0
+ *          SID: server's channel identifier
+ *          CID: client's channel identifier
+ *
+ * tcp
+ */
 void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
   uint32_t sid, nsid;
@@ -1451,6 +1709,13 @@ void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   // Docs say p1 is sid but really it is the error code
   // dbr error code for AOK is 1
   //
+  //           cmd: 15
+  //  payload size: size of our payload
+  //     data type: type of payload (hint: same as request)
+  //   data length: number of elements (should be same as request)
+  //    error code: 1 for AOK
+  //          ioid: Id from client
+  //
   format_dbr( pgr, r, 15, emh.dtype, emh.dcount, 1, ioid);
 
   PQclear( pgr);
@@ -1460,11 +1725,13 @@ void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  hex_dump( r->bufsize, r->buf);
 }
 
-// cmd 16
-// tcp
-// Obsolete
-// Not implemented here
-//
+/** Obsolete and undocumented
+ *
+ * cmd 16
+ * tcp
+ * Obsolete
+ * Not implemented here
+ */
 void cmd_ca_proto_read_build( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1473,11 +1740,19 @@ void cmd_ca_proto_read_build( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Read Build\n");
 }
 
-// cmd 17
-// udp
-// TODO
-// Implement when we start operating as a repeater
-//
+/** Confirms successful repeater client registration
+ *
+ *           cmd: 17
+ *  payload size:  0
+ *     data type:  0
+ *   data length:  0
+ *   parameter 1:  0
+ *   parameter 2:  server ip address
+ *
+ * udp
+ * TODO
+ * Implement when we start operating as a repeater
+ */
 void cmd_ca_repeater_confirm( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1486,8 +1761,17 @@ void cmd_ca_repeater_confirm( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Repeater Confirm\n");
 }
 
-// cmd 18
-// tcp
+/** Requests the creation of a channel
+ *
+ *            cmd: 18
+ *   payload size: padded length of the channel name
+ *       reserved: 0
+ *       reserved: 0
+ *            CID: client's channel identifier
+ * client version: minor protocol version of the client
+ *
+ * tcp
+ */
 void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t cid, cidn;
   uint32_t version, versionn;
@@ -1550,7 +1834,20 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
       h1 = (e_message_header_t *)r->buf;
       h2 = h1 + 1;
       h3 = h2 + 1;
-      create_message_header( h1,  0, 0, 0, 11,   0,   0);		// protocol response
+      //
+      // Responses (3, count 'em, 3)
+      //
+      // the protocol reponse cmd 3, minor version 11
+      // access rights (read and write)
+      // and
+      //           cmd: 18
+      //  payload size:  0
+      //     data type: native type
+      //    data count: native length
+      //           CID: as the client sent us
+      //           SID: our channel identifier
+      //
+      create_message_header( h1,  0, 0, 0, 11,   0,   0);		// protocol response: cmd:0  minor version: 11 (in data length field)
       create_message_header( h2, 22, 0, 0,  0, cid,   3);		// grant read (1) and write (2) access
       create_message_header( h3, 18, 0, dbr_type,  dcount, cid, sid);	// channel create response
 
@@ -1563,6 +1860,13 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   } else {
     //
     // Failed to create channel
+    //
+    //             cmd: 26
+    //  payload length: 0
+    //       data type: 0
+    //     data length: 0
+    //             CID: from client
+    //     parameter 2: 0
     //
     create_message( r, 26, 0, 0, 0, cid, 0);
 
@@ -1578,8 +1882,17 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   PQclear( pgr);
 }
 
-// cmd 19
-// tcp
+/** Writes the new channel value
+ *
+ *          cmd: 19
+ * payload size: size of the dbr formatted payload
+ *    data type: dbr type of the data
+ *   data count: number of elements
+ *          SID: server's id for this channel
+ *         IOID: client's id for this request
+ *
+ * tcp
+ */
 void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
   void *params[3];
@@ -1636,11 +1949,30 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
     PQclear( pgr);
   }
   nsid = htonl(sid);
+  //
+  // Response
+  //
+  //           cmd: 19
+  //  payload size:  0
+  //     data type: same as request
+  //   data length: same as request
+  //   status code: ECA_NORMAL (1)  or ECA_PUTFAIL (160)
+  //          IOID: from client
+  //
   create_message( r, 19, 0, emh.dtype, emh.dcount, rtn_value, ioid);
 }
 
-// cmd 20
-// tcp
+/** Sends the local username to the server
+ *
+ *           cmd: 20
+ *  payload size: string length of the user name
+ *     data type: 0
+ *   data length: 0
+ *   parameter 1: 0
+ *   parameter 2: 0
+ *
+ * tcp
+ */
 void cmd_ca_proto_client_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   char *clientName;
   e_extended_message_header_t emh;
@@ -1661,8 +1993,17 @@ void cmd_ca_proto_client_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
 }
 
-// cmd 21
-// tcp
+/** Sends the local host name to the server
+ *
+ *          cmd: 21
+ * payload size: string length of the hostname
+ *    data type: 0
+ *  data length: 0
+ *  parameter 1: 0
+ *  parameter 1: 0
+ *
+ * tcp
+ */
 void cmd_ca_proto_host_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   char *hostName;
@@ -1684,12 +2025,18 @@ void cmd_ca_proto_host_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
 }
 
-// cmd 22
-// tcp
-//
-// TODO: Implement when we act as a client.  This command on the server side is sent
-// out as a create channel request
-//
+/** Response command: notify client of access rights
+ *  Only needed as a command in the client
+ *
+ *            cmd: 22
+ *   payload size:  0
+ *      data type:  0
+ * payload length:  0
+ *            CID:  client channel identifier
+ *  Access Rights: 0 = no rights, 1 = read only, 2 = write only (really?), 3 = read and write
+ *
+ * tcp
+ */
 void cmd_ca_proto_access_rights( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1698,8 +2045,17 @@ void cmd_ca_proto_access_rights( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Access Rights\n");
 }
 
-// cmd 23
-// tcp and udp
+/** Connection verify
+ *
+ *          cmd: 23
+ * payload size:  0
+ *    data type:  0
+ *  data length:  0
+ *  parameter 1:  0
+ *  parameter 2:  0
+ *
+ * tcp and udp
+ */
 void cmd_ca_proto_echo( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1713,12 +2069,31 @@ void cmd_ca_proto_echo( e_socks_buffer_t *inbuf, e_response_t *r) {
     fprintf( stderr, "Out of memory (cmd_ca_proto_echo)\n");
     return;
   }
+  // Response
+  //
+  //          cmd: 23
+  // payload size: 0
+  //    data type: 0
+  //   data count: 0
+  //  parameter 1: 0
+  //  parameter 2: 0
+  //
   create_message( r, 23, 0, 0, 0, 0, 0);
 }
 
-// cmd 24
-// udp
-// TODO
+/** Requests registration with the repeater
+ *  NOT IMPLEMENTED
+ *
+ * cmd: 24
+ * payload size: 0
+ *    data type: 0
+ *  data length: 0
+ *  parameter 1: 0
+ *  parameter 2: IP address of client
+ *
+ * udp
+ * TODO
+ */
 void cmd_ca_repeater_register( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1727,11 +2102,13 @@ void cmd_ca_repeater_register( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Repeater Register\n");
 }
 
-// cmd 25
-// tcp
-// Obsolete
-// Not implemented here
-//
+/** obsolete and undocumented
+ *
+ * cmd: 25
+ * tcp
+ * Obsolete
+ * Not implemented here
+ */
 void cmd_ca_proto_signal( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1740,10 +2117,19 @@ void cmd_ca_proto_signal( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Signal\n");
 }
 
-// cmd 26
-// tcp
-// TODO: Implement when we need to act as a client.
-//
+/** Response to a failed channel creation
+ *  Not implemented as it is only a command on the client side
+ *
+ *          cmd: 26
+ * payload size:  0
+ *    data type:  0
+ *  data length:  0
+ *          CID:  cient id as in the original request
+ *  parameter 2:  0
+ *
+ * tcp
+ * TODO: Implement when we need to act as a client.
+ */
 void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1752,10 +2138,19 @@ void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Create ch fail\n");
 }
 
-// cmd 27
-// tcp
-// TODO: Implement when we need to act as a client
-//
+/** Notifies client that server has disconnected the channel
+ *  This is a reponse command and unimplemented here
+ *
+ *          cmd: 27
+ * payload size:  0
+ *    data type:  0
+ *  data length:  0
+ *          CID:  The client channel identifier
+ *  parameter 2:  0
+ *
+ * tcp
+ * TODO: Implement when we need to act as a client
+ */
 void cmd_ca_proto_server_disconn( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_extended_message_header_t emh;
 
@@ -1766,6 +2161,8 @@ void cmd_ca_proto_server_disconn( e_socks_buffer_t *inbuf, e_response_t *r) {
 
 
 
+/** Command array to access commands in an O(1) manner
+ */
 void (*cmds[])(e_socks_buffer_t *, e_response_t *) = {
   cmd_ca_proto_version,		//  0
   cmd_ca_proto_event_add,	//  1
@@ -1798,12 +2195,12 @@ void (*cmds[])(e_socks_buffer_t *, e_response_t *) = {
 };
 
 
-//
-// Fix up buffer pointers
-//
-// Take all unread bytes in the buffer
-// and move them to the front.
-//
+
+/** Fix up buffer pointers
+ *
+ * Take all unread bytes in the buffer
+ * and move them to the front.
+ */
 void fixup_bps( e_socks_buffer_t *b) {
   int nbytes;
 
@@ -1821,6 +2218,14 @@ void fixup_bps( e_socks_buffer_t *b) {
   b->wbp = b->buf + nbytes;
 }
 
+/** make up the reply packet
+ *
+ * \param inbuf      the buffer this is a reponse to
+ * \param rsize      size of the reply packet
+ * \param reply      The reply packet
+ * \param fromaddrp  Our from address
+ * \param fromlen    Length of our from address
+ */
 void mk_reply( e_socks_buffer_t *inbuf, int rsize, char *reply, struct sockaddr_in *fromaddrp, int fromlen) {
   e_reply_queue_t *our_reply;
   e_reply_queue_t *last_reply;		// points to the last reply in the queue
@@ -1851,10 +2256,14 @@ void mk_reply( e_socks_buffer_t *inbuf, int rsize, char *reply, struct sockaddr_
   }
 }
 
-
+/** Channel Access packet service routine
+ *
+ * \param pfd   The pollfd structure for this socket
+ * \param inbuf Our input buffer
+ */
 void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
   static struct sockaddr_in fromaddr;	// client's address
-  static int fromlen;			// used and ignored to store length of client address
+  static unsigned int fromlen;		// used and ignored to store length of client address
   static e_response_t ert[1024];	// our responses
   e_extended_message_header_t bad_cmd_header;	// used to skip commands we do not know how to handle
   void *old_rbp;			// used to be sure we are still reading from the buffer
@@ -2025,13 +2434,18 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
 }
 
 
+/** Virtual circuit listener server
+ *
+ * \param pfd   pollfd object for this socket
+ * \param inbuf Our data buffer
+ */
 void vclistener_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
   static struct sockaddr_in fromaddr;	// client's address
   static int fromlen;			// used and ignored to store length of client address
   int newsock;
   
   fromlen = sizeof( fromaddr);
-  newsock = accept( pfd->fd, (struct sockaddr *)&fromaddr, &fromlen);
+  newsock = accept( pfd->fd, (struct sockaddr *)&fromaddr, (unsigned int *)&fromlen);
 
   fprintf( stderr, "accepted socket %d from %s (vclistener_service)\n", newsock, inet_ntoa( fromaddr.sin_addr));
 
@@ -2043,7 +2457,8 @@ void vclistener_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
   }
 }
 
-
+/** Get list of kvs that have changed
+ */
 void check_monitors() {
   static e_response_t ert;
   PGresult *pgr;
@@ -2104,6 +2519,14 @@ void check_monitors() {
 
     //
     // create a message
+    // 
+    //              cmd:  1
+    //     payload size: size of the dbr data
+    //        data type: same as request
+    //      data length: shold be the same as the request (1 for now until we support arrays)
+    //      status code: ECA_NORMAL (1) on success
+    //  subscription id: as the client requested
+    //
     payload = create_message( &ert, 1, struct_size + 1*data_size, dtype, 1, 1, subid);
     
     // struct filling would go here if we did it
@@ -2132,6 +2555,12 @@ void check_monitors() {
   PQclear( pgr);
 }
 
+
+/** Send out our broadcast beacon
+ *  Set up as a signal handler for a timer
+ *
+ * \param sig  The timer signal (SIGALRM).
+*/
 void broadcast_beacon( int sig) {
   static int beaconid = 1;
   static struct itimerval timer_interval;
@@ -2175,12 +2604,23 @@ void broadcast_beacon( int sig) {
   //
   tmp = ntohl(ouraddr.sin_addr.s_addr);
 
+  // Our outgoing packet
+  //
+  //           cmd: 13
+  //  payload size:  0
+  //   server port: for us it is 5064
+  //   data length: 0
+  //     Beacon ID: sequential number
+  //    perhaps ip: 0 or our ip address
+  //
   create_message( &ert, 13, 0, 5064, 0, beaconid++, tmp);
   mk_reply( e_sock_bufs + beacon_index, ert.bufsize, ert.buf, &broadcastaddr, sizeof( broadcastaddr));
 
 }
 
 
+/** our main routine (of course)
+ */
 int main( int argc, char **argv) {
   static int sock;			// our main socket
   static int vclistener;		// our tcp listener

@@ -1,5 +1,5 @@
 
 
-e: e.c
-	gcc e.c -o e -lpq
+e: e.c Makefile
+	gcc -Wall e.c -o e -lpq -pg
 
