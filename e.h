@@ -69,16 +69,18 @@ typedef struct e_reply_queue_struct {
 // persistent socket information
 //
 typedef struct e_socks_buffer_struct {
-  char *host_name;	// read from host name command
-  char *user_name;	// read from user name command
-  int sock;		// our socket
-  void *buf;		// input buffer
-  int active;		// -1 when connection made; otherwise a count of active PV's served, 0 to close tcp connection
-  int events_on;	// 1 means send subscription updates, 0 means drop them in the bit bucket
-  int bufsize;		// size of the buffer
-  char *rbp;		// pointer to the next position in the buffer to read from
-  char *wbp;		// pointer to the next position in the buffer to write to
-  e_reply_queue_t *reply_q;	// packets ready to send
+  char *host_name;			// read from host name command
+  char *user_name;			// read from user name command
+  int sock;				// our socket
+  void *buf;				// input buffer
+  int active;				// -1 when connection made; otherwise a count of active PV's served, 0 to close tcp connection
+  int events_on;			// 1 means send subscription updates, 0 means drop them in the bit bucket
+  int bufsize;				// size of the buffer
+  e_extended_message_header_t emh;	// the message header parsed from the socket
+  char *payload;			// the payload from message emh
+  char *rbp;				// pointer to the next position in the buffer to read from
+  char *wbp;				// pointer to the next position in the buffer to write to
+  e_reply_queue_t *reply_q;		// packets ready to send
 } e_socks_buffer_t;
 
 //

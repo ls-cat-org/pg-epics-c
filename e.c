@@ -24,8 +24,6 @@ static int ht_max_size = (8 * 1024);				//!< maximum size of the hash table
 static uint32_t ht_seq = 0;					//!< the magic sequence number to get all the kvs that have changed since we last checked
 static e_kvpair_t *kvpair_list=NULL;				//!< Our list of kvpairs: used only to rebuild hash table
 
-static int maybe_check_monitors = 0;	//!< a set value might have changed a monitor (TODO: have set return a parameter that says for sure if we need to check monitors)
-
 static PGconn *q = NULL;					//!< Our connection to the postgresql server
 
 /** List of statements we'll be calling
@@ -33,7 +31,7 @@ static PGconn *q = NULL;					//!< Our connection to the postgresql server
  */
 char* prepared_statements[] = {
   "prepare set_str_value (int,text) as select e.set_str_value($1,$2) as rtn",
-  "prepare getkvs (int) as select e.getkvs( $1)"
+  "prepare getkvs (int) as select * from e.getkvs( $1)"
 };
 
 /** List of sizes for the various dbr types.
@@ -84,6 +82,23 @@ e_dbr_size_t dbr_sizes[] = {
   { "class_name",   0, 0}
 };
 
+e_socks_buffer_t *find_e_socks_buffer( int sock) {
+  int buf_index;
+  int i;
+  for( i=0; i<n_e_socks_max; i++) {
+    buf_index = (sock+i) % n_e_socks_max;
+    if( e_sock_bufs[buf_index].sock == sock)
+      break;
+  }
+  if( i > n_e_socks_max) {
+    fprintf( stderr, "find_e_socks_buffer: could not find buffer for socket %d\n", sock);
+    return NULL;
+  }
+  return e_sock_bufs + buf_index;
+}
+
+
+
 /** Debugging packet helper
  *  \param n  Number of characters to spew
  *  \param s  The buffer to disgorge
@@ -110,6 +125,7 @@ void hex_dump( int n, char *s) {
 int e_socks_buf_init( int sock) {
   int i, j;
 
+  fprintf( stderr, "initializing socket %d max of %d\n", sock, n_e_socks_max);
   for( i=0; i<n_e_socks_max; i++) {
     //
     // This tries make the index the same as the socket number
@@ -119,7 +135,7 @@ int e_socks_buf_init( int sock) {
     //
     // Found a free one
     //
-    if( e_socks_bufs[j].sock == sock || e_socks_bufs[j] == -1) {
+    if( e_sock_bufs[j].sock == sock || e_sock_bufs[j].sock == -1) {
       if( e_sock_bufs[j].buf != NULL) {
 	free( e_sock_bufs[j].buf);
 	e_sock_bufs[j].buf = NULL;
@@ -141,7 +157,7 @@ int e_socks_buf_init( int sock) {
   e_sock_bufs[j].active    = -1;
   e_sock_bufs[j].events_on = 1;
   e_sock_bufs[j].bufsize   = 4096;
-  e_sock_bufs[j].buf       = calloc( e_sock_bufs[i].bufsize, 1);
+  e_sock_bufs[j].buf       = calloc( e_sock_bufs[j].bufsize, 1);
   if( e_sock_bufs[j].buf == NULL) {
     fprintf( stderr, "out of memory for sock %d (e_socks_buf_init)\n", sock);
   }
@@ -1174,6 +1190,10 @@ void read_message_header( e_socks_buffer_t *inbuf, e_message_header_t *h) {
   h->dcount = ntohs( h->dcount);
   h->p1     = ntohl( h->p1);
   h->p2     = ntohl( h->p2);
+
+  inbuf->payload = inbuf->rbp;
+  inbuf->rbp    += h->plsize;
+
 }
 
 /** Convert an extended header to native byte order
@@ -1185,10 +1205,15 @@ void read_message_header( e_socks_buffer_t *inbuf, e_message_header_t *h) {
  * \param inbuf  The incomming buffer to conver
  * \param h      The buffer to return
  */
-void read_extended_message_header( e_socks_buffer_t *inbuf, e_extended_message_header_t *h) {
+void read_extended_message_header( e_socks_buffer_t *inbuf) {
   struct e_message_header mh;
+  e_extended_message_header_t *h;
+
+  h = &(inbuf->emh);
 
   if( get_header_type( inbuf->rbp)) {
+    memcpy( h, inbuf->rbp, sizeof( struct e_extended_message_header));
+
     h->cmd    = ntohs( h->cmd);
     h->dtype  = ntohs( h->dtype);
     h->p1     = ntohl( h->p1);
@@ -1196,7 +1221,10 @@ void read_extended_message_header( e_socks_buffer_t *inbuf, e_extended_message_h
     h->plsize = ntohl( h->plsize);
     h->dcount = ntohl( h->dcount);
 
-    inbuf->rbp += sizeof( e_extended_message_header_t);
+    inbuf->rbp     += sizeof( e_extended_message_header_t);
+    inbuf->payload  = inbuf->rbp;
+
+    inbuf->rbp += inbuf->emh.plsize;
     return;
   }
 
@@ -1210,6 +1238,8 @@ void read_extended_message_header( e_socks_buffer_t *inbuf, e_extended_message_h
   h->p2     = mh.p2;
   h->plsize = mh.plsize;
   h->dcount = mh.dcount;
+
+  return;
 }
 
 
@@ -1239,9 +1269,8 @@ void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   // Docs also specify that field p1 "Must be 0." but it looks to contain a counter.
   //
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
+  fprintf( stderr, "Protocol version received\n");
 }
 
 
@@ -1261,8 +1290,6 @@ void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
  * \param r     Our response
  */
 void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-  void *payload;
   uint16_t *tmp;
   uint32_t sid;
   uint32_t cid;
@@ -1272,14 +1299,10 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_channel_t *chans;
   e_subscription_t *subs;
 
-  read_extended_message_header( inbuf, &emh);
+  tmp = (uint16_t *)(inbuf->payload + 12);	// skip 3 obsolete 32 bit float values
 
-  payload = inbuf->rbp + 12;	// skip 3 obsolete 32 bit float values
-  tmp = payload;
-  inbuf->rbp += emh.plsize;
-
-  sid = emh.p1;
-  cid = emh.p2;
+  sid = inbuf->emh.p1;
+  cid = inbuf->emh.p2;
 
   sprintf( sid_key, "%08x", sid);
 
@@ -1297,10 +1320,10 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
       return;
     }
     subs = calloc( 1, sizeof( e_subscription_t));
-    subs->dtype  = emh.dtype;
-    subs->dcount = emh.dcount;
+    subs->dtype  = inbuf->emh.dtype;
+    subs->dcount = inbuf->emh.dcount;
     subs->mask   = *tmp;
-    subs->subid  = emh.p2;
+    subs->subid  = inbuf->emh.p2;
     subs->next   = chans->subs;
     chans->subs  = subs;
 
@@ -1313,7 +1336,7 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
     //     status code: ECA_NORMAL (1) on success
     // Subscription ID: same as request
     //
-    format_kvp( kvpp, r, 1, emh.dtype, emh.dcount, 1, emh.p2);
+    format_kvp( kvpp, r, 1, inbuf->emh.dtype, inbuf->emh.dcount, 1, inbuf->emh.p2);
 
   }
 }
@@ -1330,7 +1353,6 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
   uint32_t sid, subid;
 
   char sid_key[9];
@@ -1340,13 +1362,8 @@ void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_subscription_t *subs, *last_sub;
   int foundIt;
   
-  read_extended_message_header( inbuf, &emh);
-
-
-  inbuf->rbp += emh.plsize;
-
-  sid   = emh.p1;
-  subid = emh.p2;
+  sid   = inbuf->emh.p1;
+  subid = inbuf->emh.p2;
 
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
@@ -1384,12 +1401,8 @@ void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not supported here
  */
 void cmd_ca_proto_read( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
   //  printf( "Proto Read\n");
-
-  inbuf->rbp += emh.plsize;
 }
 
 /** Write a new channel value
@@ -1404,8 +1417,6 @@ void cmd_ca_proto_read( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-  char *payload;
   void *params[3];
   int param_lengths[3];
   int param_formats[3];
@@ -1417,44 +1428,41 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t ioid, sid, nsid;
   char s[128];
 
-  read_extended_message_header( inbuf, &emh);
-  sid = emh.p1;
+  sid = inbuf->emh.p1;
   nsid = htonl(sid);
-  ioid = emh.p2;
-  emh.dcount = 1;	// hold the arrays
+  ioid = inbuf->emh.p2;
+  inbuf->emh.dcount = 1;	// hold the arrays
 
   //
   // Discover our data size (shouldn't we just create an array at initiallizaion or compile time?...)
   //
-  dbr_type = htonl(emh.dtype);
-  struct_size = dbr_sizes[emh.dtype].dbr_struct_size;
-  data_size   = dbr_sizes[emh.dtype].dbr_type_size;
+  dbr_type = htonl(inbuf->emh.dtype);
+  struct_size = dbr_sizes[inbuf->emh.dtype].dbr_struct_size;
+  data_size   = dbr_sizes[inbuf->emh.dtype].dbr_type_size;
 
   //
   // TO DO:
   // add proper array support by implementing the postgresql/libpq array structures
   //
-  payload = inbuf->rbp;
-  switch( emh.dtype) {
+  switch( inbuf->emh.dtype) {
 
   case  0:	// string
   case  7:
   case 14:
   case 21:
   case 28:
-    sp = payload;
+    sp = inbuf->payload;
     s_size = strlen( sp)+1;
     printf( "Proto Write:  String %s\n", sp);
-    if( payload + s_size > inbuf->wbp) {
+    if( inbuf->payload + s_size > inbuf->wbp) {
       fprintf( stderr, "Bad string detected (cmd_ca_proto_write)\n");
       inbuf->rbp = inbuf->wbp;
       return;
     }
-    payload += s_size + 1;
+    inbuf->payload += s_size + 1;
     params[0] = &nsid;	        param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
     params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1465,14 +1473,13 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 15:
   case 22:
   case 29:
-    snprintf( s, sizeof( s)-1, "%d", ntohs(*(int16_t *)payload));
+    snprintf( s, sizeof( s)-1, "%d", ntohs(*(int16_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
     printf( "Proto Write:  16 bit int %s\n", s);
-    payload += 2;
+    inbuf->payload += 2;
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1485,15 +1492,14 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 30:
     {
       uint32_t tmp;
-      tmp = ntohs( *(uint32_t *)payload);
+      tmp = ntohs( *(uint32_t *)(inbuf->payload));
       snprintf( s, sizeof( s)-1, "%f", *(float *)&tmp);
       s[sizeof(s)-1] = 0;
       printf( "Proto Write:  32 bit float %s\n", s);
-      payload += 4;
+      inbuf->payload += 4;
       params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
       params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
       pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-      maybe_check_monitors = 1;
       if( pgr == NULL)
 	return;
       PQclear( pgr);
@@ -1505,14 +1511,13 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 17:
   case 24:
   case 31:
-    snprintf( s, sizeof( s)-1, "%u", ntohs(*(uint16_t *)payload));
+    snprintf( s, sizeof( s)-1, "%u", ntohs(*(uint16_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
     printf( "Proto Write:  enum: %s\n", s);
-    payload += 2;
+    inbuf->payload += 2;
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1523,14 +1528,13 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 18:
   case 25:
   case 32:
-    snprintf( s, sizeof( s)-1, "%u", *(unsigned char *)payload);
+    snprintf( s, sizeof( s)-1, "%u", *(unsigned char *)(inbuf->payload));
     s[sizeof(s)-1] = 0;
     printf( "Proto Write:  8 bit int %s\n", s);
-    payload += 1;
+    inbuf->payload += 1;
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1541,14 +1545,13 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 19:
   case 26:
   case 33:
-    snprintf( s, sizeof( s)-1, "%d", ntohl( *(int32_t *)payload));
+    snprintf( s, sizeof( s)-1, "%d", ntohl( *(int32_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
     printf( "Proto Write:  32 bit int %s\n", s);
-    payload += 4;
+    inbuf->payload += 4;
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
@@ -1559,22 +1562,18 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 20:
   case 27:
   case 34:
-    snprintf( s, sizeof( s)-1, "%f", unswapd( *(long long *)payload));
+    snprintf( s, sizeof( s)-1, "%f", unswapd( *(long long *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
     printf( "Proto Write:  64 bit double %s\n", s);
-    payload += 8;
+    inbuf->payload += 8;
     params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
     params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     PQclear( pgr);
     break;
   }
-
-
-  inbuf->rbp += emh.plsize;
 }
 
 /** Obsolete function unsupported here
@@ -1584,10 +1583,6 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not supported here
  */
 void cmd_ca_proto_snapshot( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
 }
 
 /** Searches for a given channel name
@@ -1608,26 +1603,24 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   int cid;
   char *pl;
   int foundIt;
-
-  e_extended_message_header_t emh;
   ENTRY entry_in, *entry_outp;
 
-  read_extended_message_header( inbuf, &emh);
-  pl = inbuf->rbp;
-  pl[emh.plsize-1] = 0;
-  inbuf->rbp += emh.plsize;
+  pl = inbuf->payload;
+  if( inbuf->emh.plsize <= 0) {
+    fprintf( stderr, "cmd_ca_proto_search: no channel name requested\n");
+    return;
+  }
+  pl[inbuf->emh.plsize-1] = 0;
 
-  reply   = emh.dtype;
-  version = emh.dcount;
+  reply    = inbuf->emh.dtype;
+  version  = inbuf->emh.dcount;
   versionn = htonl( version);
-  cid     = emh.p1;
+  cid      = inbuf->emh.p1;
 
   if( strcmp( "thisIsTheEnd", pl) == 0) {
     exit( 0);
   }
 
-
-  
   //
   // Reject requests from other networks
   //
@@ -1646,6 +1639,7 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   if( foundIt) {
     uint16_t server_protocol_version = 11, *spvp;
 
+    fprintf( stderr, "cmd_ca_proto_search: found channel %s  socket=%d\n", pl, inbuf->sock);
     // Response
     //
     //          cmd: 6
@@ -1692,10 +1686,6 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not supported here
  */
 void cmd_ca_proto_build( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
 }
 
 /** Disable server from sending subscription updates to this circuit
@@ -1710,12 +1700,8 @@ void cmd_ca_proto_build( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
-  //
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   inbuf->events_on = 0;
+  //  printf( "Events off\n");
 }
 
 
@@ -1731,10 +1717,6 @@ void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_events_on( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   inbuf->events_on = 1;
   //  printf( "Events on\n");
 }
@@ -1747,10 +1729,6 @@ void cmd_ca_proto_events_on( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not implemented here
  */
 void cmd_ca_proto_read_sync( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Read Sync\n");
 }
 
@@ -1768,10 +1746,6 @@ void cmd_ca_proto_read_sync( e_socks_buffer_t *inbuf, e_response_t *r) {
  * UNIMPLIMENTED
  */
 void cmd_ca_proto_error( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Proto Error\n");
 }
 
@@ -1788,17 +1762,14 @@ void cmd_ca_proto_error( e_socks_buffer_t *inbuf, e_response_t *r) {
  */
 void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t sid, cid;
-  e_extended_message_header_t emh;
   ENTRY entry_in, *entry_outp;
   e_kvpair_t *kvpp;
   e_channel_t *chans, *last_chan;
   e_subscription_t *subs, *last_sub;
   char sid_key[9];
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
-  sid = emh.p1;
-  cid = emh.p2;
+  sid = inbuf->emh.p1;
+  cid = inbuf->emh.p2;
 
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
@@ -1862,23 +1833,20 @@ void cmd_ca_proto_rsrv_is_up( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t beaconid;
 
   struct in_addr addr;
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
-  beaconid = emh.p1;
+  beaconid = inbuf->emh.p1;
 
-  if( emh.p2 == 0) {
+  if( inbuf->emh.p2 == 0) {
     addr = r->peer.sin_addr;
   } else {
-    addr.s_addr     = htonl(emh.p2);
+    addr.s_addr     = htonl( inbuf->emh.p2);
   }
   // printf( "Beacon from %s with id %d\n", inet_ntoa( addr), beaconid);
 }
 
 
 /** Indicates the requested channel does not exist
- *  Currently unimplement as this is a response command and onlly
+ *  Currently unimplement as this is a response command and only
  *  implemented in the client.
  *
  *            cmd: 14
@@ -1893,10 +1861,6 @@ void cmd_ca_proto_rsrv_is_up( e_socks_buffer_t *inbuf, e_response_t *r) {
  * As a server, this is possibly sent in response to a failed ca_proto_search request.
  */
 void cmd_ca_proto_not_found( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Not Found\n");
 }
 
@@ -1913,17 +1877,14 @@ void cmd_ca_proto_not_found( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
   uint32_t sid;
   uint32_t ioid;
   ENTRY entry_in, *entry_outp;
   char sid_key[9];
   e_kvpair_t *kvpp;
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
-  sid  = emh.p1;
-  ioid = emh.p2;
+  sid  = inbuf->emh.p1;
+  ioid = inbuf->emh.p2;
 
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
@@ -1944,12 +1905,12 @@ void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   //    error code: 1 for AOK
   //          ioid: Id from client
   //
-  format_kvp( kvpp, r, 15, emh.dtype, emh.dcount, 1, ioid);
+  format_kvp( kvpp, r, 15, inbuf->emh.dtype, inbuf->emh.dcount, 1, ioid);
 
   
   
 
-  //  fprintf( stderr, "Read Notify for sid=%d  ioid=%d   dtype=%d\n", sid, ioid, emh.dtype);
+  //  fprintf( stderr, "Read Notify for sid=%d  ioid=%d   dtype=%d\n", sid, ioid, inbuf->emh.dtype);
   //  fprintf( stderr, "read_notify result:\n");
   //  hex_dump( r->bufsize, r->buf);
 }
@@ -1962,10 +1923,6 @@ void cmd_ca_proto_read_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not implemented here
  */
 void cmd_ca_proto_read_build( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Read Build\n");
 }
 
@@ -1983,10 +1940,6 @@ void cmd_ca_proto_read_build( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Implement when we start operating as a repeater
  */
 void cmd_ca_repeater_confirm( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Repeater Confirm\n");
 }
 
@@ -2005,23 +1958,17 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t cid, cidn;
   uint32_t version, versionn;
   
-  char *payload;
-  e_extended_message_header_t emh;
   e_message_header_t *h1, *h2, *h3;
   ENTRY entry_in, *entry_outp;
   e_kvpair_t       *kvpp;
   e_channel_t      *chans;
 
-  read_extended_message_header( inbuf, &emh);
-  payload = inbuf->rbp;		// pointer to our string
-  payload[emh.plsize-1] = 0;	// ensure it is null terminated
-  inbuf->rbp += emh.plsize;
-  cid = emh.p1;
-  version = emh.p2;
+  inbuf->payload[inbuf->emh.plsize-1] = 0;	// ensure it is null terminated
+  cid = inbuf->emh.p1;
+  version = inbuf->emh.p2;
 
 
 
-  //  fprintf( stderr, "Create Chan with name '%s'\n", payload);
   if( inbuf->host_name == NULL)
     inbuf->host_name = strdup("");
   if( inbuf->user_name == NULL)
@@ -2029,12 +1976,15 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   cidn = htonl( cid);
   versionn = htonl( version);
 
+  fprintf( stderr, "Create Chan with name '%s' for user '%s' on machine '%s'\n", inbuf->payload, inbuf->user_name, inbuf->host_name);
+
+
   // ignore requests outside of our private network
   //
   if( (r->peer.sin_addr.s_addr | ournetmask_addr.s_addr) != ournetmask_addr.s_addr)
     return;
     
-  entry_in.key = payload;
+  entry_in.key = inbuf->payload;
   entry_outp = hsearch( entry_in, FIND);
   if( entry_outp != NULL && entry_outp->data != NULL) {
     kvpp = entry_outp->data;
@@ -2108,7 +2058,6 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
   void *params[3];
   int param_lengths[3];
   int param_formats[3];
@@ -2125,12 +2074,10 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   char sid_key[9];
   e_kvpair_t *kvpp;
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   
-  sid = emh.p1;
-  ioid = emh.p2;
-  emh.dcount = 1;	// hold the arrays
+  sid  = inbuf->emh.p1;
+  ioid = inbuf->emh.p2;
+  inbuf->emh.dcount = 1;	// hold the arrays
 
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
@@ -2149,9 +2096,9 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   // Discover our data size
   //
-  dbr_type = htonl(emh.dtype);
-  struct_size = dbr_sizes[emh.dtype].dbr_struct_size;
-  data_size   = dbr_sizes[emh.dtype].dbr_type_size;
+  dbr_type = htonl(inbuf->emh.dtype);
+  struct_size = dbr_sizes[inbuf->emh.dtype].dbr_struct_size;
+  data_size   = dbr_sizes[inbuf->emh.dtype].dbr_type_size;
 
   rtn = 160;	// default ca put fail
   printf( "Proto Write Notify\n");
@@ -2161,11 +2108,11 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   // TO DO:
   // add proper array support by implementing the postgresql/libpq array structures
   //
-  switch( emh.dtype) {
+  switch( inbuf->emh.dtype) {
   case 0:
-    sp = inbuf->rbp;
+    sp = inbuf->payload;
     s_size = strlen( sp);
-    if( inbuf->rbp + s_size > inbuf->wbp) {
+    if( inbuf->payload + s_size > inbuf->wbp) {
       fprintf( stderr, "Bad string detected (cmd_ca_proto_write_notify)\n");
       inbuf->rbp = inbuf->wbp;
       return;
@@ -2178,11 +2125,10 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
       }
     }
 
-    inbuf->rbp += s_size;
+    inbuf->payload += s_size;
     params[0] = &nsid;	param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
     params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 1);
-    maybe_check_monitors = 1;
     if( pgr == NULL)
       return;
     rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
@@ -2199,7 +2145,7 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   //   status code: ECA_NORMAL (1)  or ECA_PUTFAIL (160)
   //          IOID: from client
   //
-  create_message( r, 19, 0, emh.dtype, emh.dcount, rtn_value, ioid);
+  create_message( r, 19, 0, inbuf->emh.dtype, inbuf->emh.dcount, rtn_value, ioid);
 }
 
 /** Sends the local username to the server
@@ -2215,19 +2161,16 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
  */
 void cmd_ca_proto_client_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   char *clientName;
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
-  clientName = inbuf->rbp;
-  clientName[emh.plsize - 1] = 0;
-  inbuf->rbp += emh.plsize;
+  clientName = inbuf->payload;
+  clientName[inbuf->emh.plsize - 1] = 0;
 
   if( inbuf->user_name != NULL) {
     free( inbuf->user_name);
   }
   inbuf->user_name = strdup( clientName);
 
-  //  printf( "Client Name '%s'\n", clientName);
+  fprintf( stderr, "Client Name '%s'\n", clientName);
   //
   // no response
   //
@@ -2247,19 +2190,16 @@ void cmd_ca_proto_client_name( e_socks_buffer_t *inbuf, e_response_t *r) {
 void cmd_ca_proto_host_name( e_socks_buffer_t *inbuf, e_response_t *r) {
   //
   char *hostName;
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
-  hostName = inbuf->rbp;
-  hostName[emh.plsize - 1] = 0;
-  inbuf->rbp += emh.plsize;
+  hostName = inbuf->payload;
+  hostName[inbuf->emh.plsize - 1] = 0;
 
   if( inbuf->host_name != NULL) {
     free( inbuf->host_name);
   }
   inbuf->host_name = strdup( hostName);
 
-  //  printf( "Host Name '%s'\n", hostName);
+  fprintf( stderr, "Host Name '%s'\n", hostName);
   //
   // no response
   //
@@ -2278,10 +2218,6 @@ void cmd_ca_proto_host_name( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_access_rights( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Access Rights\n");
 }
 
@@ -2297,10 +2233,6 @@ void cmd_ca_proto_access_rights( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp and udp
  */
 void cmd_ca_proto_echo( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Echo\n");
 
   r->bufsize = sizeof( e_message_header_t);
@@ -2335,10 +2267,7 @@ void cmd_ca_proto_echo( e_socks_buffer_t *inbuf, e_response_t *r) {
  * TODO
  */
 void cmd_ca_repeater_register( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Repeater Register\n");
 }
 
@@ -2350,10 +2279,7 @@ void cmd_ca_repeater_register( e_socks_buffer_t *inbuf, e_response_t *r) {
  * Not implemented here
  */
 void cmd_ca_proto_signal( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
 
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Signal\n");
 }
 
@@ -2371,10 +2297,6 @@ void cmd_ca_proto_signal( e_socks_buffer_t *inbuf, e_response_t *r) {
  * TODO: Implement when we need to act as a client.
  */
 void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Create ch fail\n");
 }
 
@@ -2392,10 +2314,6 @@ void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
  * TODO: Implement when we need to act as a client
  */
 void cmd_ca_proto_server_disconn( e_socks_buffer_t *inbuf, e_response_t *r) {
-  e_extended_message_header_t emh;
-
-  read_extended_message_header( inbuf, &emh);
-  inbuf->rbp += emh.plsize;
   //  printf( "Server Disconnect\n");
 }
 
@@ -2501,11 +2419,12 @@ void mk_reply( e_socks_buffer_t *inbuf, int rsize, char *reply, struct sockaddr_
  * \param pfd   The pollfd structure for this socket
  * \param inbuf Our input buffer
  */
-void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
+void ca_service( struct pollfd *pfd) {
   static struct sockaddr_in fromaddr;	// client's address
   static unsigned int fromlen;		// used and ignored to store length of client address
   static e_response_t ert[1024];	// our responses
-  e_socks_buffer_t *inbuf;
+  e_socks_buffer_t *inbuf;		// the buffer to use
+
   e_extended_message_header_t bad_cmd_header;	// used to skip commands we do not know how to handle
   void *old_rbp;			// used to be sure we are still reading from the buffer
   int nert;				// number of responses
@@ -2515,18 +2434,13 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
   void *rp;				// pointer to next location to write into reply
   int cmd;				// our current command
   int nread;				// number of bytes read
-  int j;
-  int buf_index;
 
-  for( j=0; j<n_e_socks_max; j++) {
-    buf_index = (pfd->fd + j) % n_e_socks_max;
-    if( e_sock_bufs[buf_index].sock == pfd->fd)
-      break;
-  }
-  if( j == n_e_socks_max)
+  
+  inbuf = find_e_socks_buffer( pfd->fd);
+  if( inbuf == NULL) {
+    fprintf( stderr, "ca_service: unknown socket %d\n", pfd->fd);
     return;
-
-  inbuf = e_sock_bufs + buf_index;
+  }
 
   if( pfd->revents & (POLLERR | POLLHUP | POLLNVAL)) {
     //
@@ -2605,19 +2519,18 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
     }
     inbuf->wbp += nread;
 
-    //    printf( "From %s port %d read %d bytes\n", inet_ntoa( fromaddr.sin_addr), ntohs(fromaddr.sin_port), nread);
+    // fprintf( stderr, "From %s port %d read %d bytes\n", inet_ntoa( fromaddr.sin_addr), ntohs(fromaddr.sin_port), nread);
 
     nert = 0;
     while( inbuf->rbp < inbuf->wbp) {
 
       old_rbp = inbuf->rbp;
-      cmd = get_command( inbuf->rbp);
+      read_extended_message_header( inbuf);
+      cmd = inbuf->emh.cmd;
       if( cmd <0 || cmd > 27) {
 	//
 	// Bad command: either a protocol version problem or we have a messed up packet.
 	//
-	read_extended_message_header( inbuf, &bad_cmd_header);
-	inbuf->rbp += bad_cmd_header.plsize;
 	fprintf( stderr, "unsupported command %d with payload size %d\n", cmd, bad_cmd_header.plsize);
 	if( inbuf->rbp > inbuf->wbp) {
 	  fprintf( stderr, "request to read more bytes than we have: likely we've screwed up the buffer, resetting\n");
@@ -2637,13 +2550,15 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
 
 	if( ert[nert].bufsize >= 0) {
 	  // save responses for the end
-	  nert++;
-	  if( nert > (sizeof( ert) / sizeof( ert[0]))) {
+	  if( nert >= (sizeof( ert) / sizeof( ert[0]))) {
+	    fprintf( stderr, "main: too many response buffers needed.  Max is %lu\n", sizeof( ert)/sizeof( ert[0]));
 	    //
 	    // Really, this should not happen in real life.
+	    // It looks like we'll drop some packets if it does happen.
 	    //
 	    break;
 	  }
+	  nert++;
 	}
       }
       if( inbuf->rbp == old_rbp) {
@@ -2675,8 +2590,6 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
 	  }
 	}
       
-	//	fprintf( stderr, "Making reply of %d bytes for socket %d\n", rsize, pfd->fd);
-
 	mk_reply( inbuf, rsize, reply, &fromaddr, sizeof( fromaddr));
       }
 
@@ -2691,11 +2604,20 @@ void ca_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
  * \param pfd   pollfd object for this socket
  * \param inbuf Our data buffer
  */
-void vclistener_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
-  static struct sockaddr_in fromaddr;	// client's address
-  static int fromlen;			// used and ignored to store length of client address
+void vclistener_service( struct pollfd *pfd) {
+  static struct sockaddr_in fromaddr;		// client's address
+  static int fromlen;				// used and ignored to store length of client address
+  static e_socks_buffer_t *inbuf = NULL;	// our socket buffer
   int newsock;
   
+  if( inbuf == NULL) {
+    inbuf = find_e_socks_buffer( pfd->fd);
+    if( inbuf == NULL) {
+      fprintf( stderr, "vclistener_service: could not find buffer for socket %d\n", pfd->fd);
+      return;
+    }
+  }
+
   fromlen = sizeof( fromaddr);
   newsock = accept( pfd->fd, (struct sockaddr *)&fromaddr, (unsigned int *)&fromlen);
 
@@ -2706,128 +2628,9 @@ void vclistener_service( struct pollfd *pfd, e_socks_buffer_t *inbuf) {
   }
   if( n_e_socks < n_e_socks_max) {
     e_socks_buf_init( newsock);
+  } else {
+    fprintf( stderr, "vclistener: too many sockets open (%d) to open another\n", n_e_socks);
   }
-}
-
-
-void check_monitors( e_kvpair_t *kvpp) {
-  static e_response_t ert;
-  PGresult *pgr;
-  uint32_t sid, subid, sock, dtype, cnt, eepoch, ensec;
-  char *svalue;
-  int struct_size;
-  int data_size;
-  int i, j;     // i loop over monitors, j loop over value arrays (not yet supported)
-  int k;        // loop over sock_bufs
-  void *payload;
-  e_channel_t *chans;
-  e_subscription_t *subs;
-
-  j = 0;
-
-  for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
-    for( subs = chans->subs; subs != NULL; subs = subs->next) {
-      //
-      // create a message
-      payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
-
-      // struct filling would go here if we did it
-
-      mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
-
-      payload += struct_size;
-
-      pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
-
-      //    fprintf( stderr, "check_monitors hex_dump:\n");
-      //    hex_dump( ert.bufsize, ert.buf);
-
-      if( ert.buf != NULL && ert.bufsize > 0) {
-	for( k=0; k<n_e_socks_max; k++) {
-	  
-	  if( e_sock_bufs[(k+sock) % e_socks_max].sock == sock) {
-	    break;
-	  }
-	}
-	if( k<n_e_socks_max) {
-	  mk_reply( e_sock_bufs+((k+sock) % e_socks_max), ert.bufsize, ert.buf, NULL, 0);
-	}
-      
-
-
-  pgr = e_execPrepared( "check_monitors", 0, NULL, NULL, NULL, 1);
-  if( pgr == NULL)
-    return;
-
-  for( i=0; i<PQntuples( pgr); i++) {
-    //
-    // Only handle scalers for now.  Arrays require a call to get_values.
-    //
-    sid   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "sid")));
-    subid = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "subid")));
-    sock  = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "sock")));
-    dtype = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "dtype")));
-    cnt   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "cnt")));
-    eepoch= ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "eepoch")));
-    ensec = ntohl( *(uint32_t *)PQgetvalue( pgr, i, PQfnumber( pgr, "ensec")));
-    svalue = PQgetvalue( pgr, i, PQfnumber( pgr, "val"));
-
-
-    struct_size = dbr_sizes[dtype].dbr_struct_size;
-    data_size   = dbr_sizes[dtype].dbr_type_size;
-
-    // Propagate the evil epics fixed length string
-    //
-    if( dtype % 7 == 0) {
-      if( cnt == 1) {
-        data_size = strlen( svalue) + 1;
-      } else {
-        data_size = MAX_STRING_SIZE;
-      }
-    }
-
-    // Today we only support monitors on scalers
-    //
-    cnt = 1;
-
-    ert.bufsize = struct_size + 1*data_size;
-    ert.buf     = calloc( ert.bufsize, 1);
-    if( ert.buf == NULL) {
-      fprintf( stderr, "out of memory for buffer %d (check_monitors)\n", sock);
-      continue;
-    }
-
-    //    fprintf( stderr, "check_monitors    sock: %d   dtype: %d   cnt: %d   svalue: '%s' struct_size: %d  data_size: %d bufsize: %d\n",
-    //                                        sock,      dtype,      cnt,      svalue,      struct_size,     data_size,    ert.bufsize);
- 
-    //
-    // create a message
-    payload = create_message( &ert, 1, struct_size + 1*data_size, dtype, 1, 1, subid);
-
-    // struct filling would go here if we did it
-
-    mk_dbr_struct( payload, dtype, eepoch, ensec, "0", "0", 0, 0, 0);
-
-    payload += struct_size;
-
-    pack_dbr_data( payload, dtype, svalue);
-
-    //    fprintf( stderr, "check_monitors hex_dump:\n");
-    //    hex_dump( ert.bufsize, ert.buf);
-
-    if( ert.buf != NULL && ert.bufsize > 0) {
-      for( k=0; k<n_e_socks_max; k++) {
-        if( e_sock_bufs[((k+sock) % n_e_socks_max)].sock == sock) {
-          break;
-        }
-      }
-      if( k<n_e_socks_max) {
-        mk_reply( e_sock_bufs+((k+sock) % n_e_socks_max), ert.bufsize, ert.buf, NULL, 0);
-      }
-    }
-  }
-
-  PQclear( pgr);
 }
 
 
@@ -2896,6 +2699,7 @@ void update_ht() {
       //
       // Update this one
       //
+      kvpp = entry_outp->data;
       if( kvpp->kvvalue != NULL)
 	free( kvpp->kvvalue);
       kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_name_col));
@@ -3083,12 +2887,15 @@ int main( int argc, char **argv) {
 
 
 
+  fprintf( stderr, "initialization starting\n");
+
   // flag all the socket buffers to be available
   //
-  for( i=0; i < n_e_socs_max; i++) {
+  for( i=0; i < n_e_socks_max; i++) {
     e_socks[i].fd          = -1;
-    e_sock_bufs[j].buf     = NULL;
-    e_sock_bufs[j].bufsize = 0;
+    e_sock_bufs[i].sock    = -1;
+    e_sock_bufs[i].buf     = NULL;
+    e_sock_bufs[i].bufsize = 0;
   }
 
   //
@@ -3232,24 +3039,27 @@ int main( int argc, char **argv) {
   }
 
 
+  fprintf( stderr, "initialization complete\n");
   while( 1) {
 
     //
     // Fill up the fd array
     // Ignore stdin, stdout, stderr
     for( i=0, sock=3; sock<e_max_socket_number; sock++) {
-      for( k=0; k<n_e_socks_max; k++) {
-	buf_index = (sock + k) % n_esocks_max;
-	if( e_sock_bufs[buf_index].sock == sock)
-	  break;
+      e_socks_buffer_t *sbuff;
+
+      sbuff = find_e_socks_buffer( sock);
+      if( sbuff == NULL)
+	continue;
+
+      e_socks[i].fd = sock;
+      e_socks[i].events = POLLIN;
+
+      if( sbuff->reply_q != NULL) {
+	e_socks[i].events |= POLLOUT;
+	fprintf( stderr, "main: pollout set for socket %d\n", sock);
       }
-      if( k < e_socks_max && e_sock_bufs[buf_index].active > 0) {
-	e_socks[i].fd = j;
-	e_socks[i].events = POLLIN;
-	if( e_socks_bufs[buf_index].reply_q != NULL)
-	  e_socks[i].events |= POLLOUT;
-	i++;
-      }	  
+      i++;
     }
     n_e_socks = i;
 
@@ -3267,17 +3077,16 @@ int main( int argc, char **argv) {
 	nfds--;
 	
 	if( e_socks[i].fd == vclistener) {
-	  vclistener_service( e_socks+i, e_sock_bufs+i);
+	  vclistener_service( e_socks+i);
 	} else if( e_socks[i].fd == PQsocket(q)) {
 	  //
 	  // The only thing that would come over the pg socket
-	  // would be a notify about a monitor update.
+	  // would be a notify about a monitor update (which we ignore).
 	  //
 	  PQconsumeInput( q);
 	  while( PQnotifies( q) != NULL);
-	  //	  check_monitors();
 	} else {
-	  ca_service( e_socks+i, e_sock_bufs+i);
+	  ca_service( e_socks+i);
 	}
       }
     }
