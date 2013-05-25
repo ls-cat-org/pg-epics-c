@@ -1,4 +1,4 @@
-/*! \file e.c
+/*  \file e.c
  *  \brief LS-CAT postgres KV Pairs to EPICS connector
  *  \date 2013
  *  \author Keith Brister
@@ -103,9 +103,12 @@ e_socks_buffer_t *find_e_socks_buffer( int sock) {
  *  \param n  Number of characters to spew
  *  \param s  The buffer to disgorge
  */
-void hex_dump( int n, char *s) {
-  int i,j;
-  
+void hex_dump( int n, char *ss) {
+  int i,j, n2;
+  unsigned char *s;
+
+  n2 = n;
+  s = (unsigned char *)ss;
 
   for( i=0; n > 0; i++) {
     for( j=0; j<16 && n > 0; j++) {
@@ -113,6 +116,14 @@ void hex_dump( int n, char *s) {
 	fprintf( stderr, "  ");
       fprintf( stderr, " %02x", *(s + 16*i + j));
       n--;
+    }
+    fprintf( stderr, "     ");
+
+    for( j=0; j<16 && n2 > 0; j++) {
+      if( j==8)
+	fprintf( stderr, " ");
+      fprintf( stderr, "%c", isprint( *(s + 16*i + j)) ? *(s + 16*i + j) : '.');
+      n2--;
     }
     fprintf( stderr, "\n");
   }
@@ -169,6 +180,48 @@ int e_socks_buf_init( int sock) {
 
   return j;
 }
+
+/** Close a socket and associated buffer
+ */
+void e_socks_buf_close( e_socks_buffer_t *esb) {
+  int i;
+
+  esb->active  = 0;
+
+  if( e_max_socket_number <= esb->sock) {
+    e_max_socket_number = 0;
+    for( i=0; i<n_e_socks_max; i++) {
+      if( e_sock_bufs[i].active != 0 )
+	  if( e_sock_bufs[i].sock > e_max_socket_number)
+	    e_max_socket_number = e_sock_bufs[i].sock;
+    }
+  }
+
+  if( esb->sock != -1) {
+    close( esb->sock);
+    esb->sock = -1;
+  }
+  if( esb->host_name != NULL) {
+    free( esb->host_name);
+    esb->host_name = NULL;
+  }
+  if( esb->user_name != NULL) {
+    free( esb->user_name);
+    esb->user_name = NULL;
+  }
+  if( esb->bufsize >0 && esb->buf != NULL) {
+    free( esb->buf);
+  }
+  esb->bufsize = 0;
+  esb->buf     = NULL;
+  esb->rbp     = NULL;
+  esb->wbp     = NULL;
+  esb->reply_q = NULL;
+
+}
+
+
+
 
 /** Connect to our database server
  */
@@ -1270,7 +1323,7 @@ void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
   // Docs also specify that field p1 "Must be 0." but it looks to contain a counter.
   //
 
-  fprintf( stderr, "Protocol version received\n");
+  //  fprintf( stderr, "Protocol version received\n");
 }
 
 
@@ -1317,6 +1370,10 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
     }
     if( chans == NULL) {
       fprintf( stderr, "cmd_ca_proto_event_add: no channel found for socket %d and cid %d\n", inbuf->sock, cid);
+      //
+      // Signal a bad channel id
+      //
+      create_message( r, 1, 0, inbuf->emh.dtype, inbuf->emh.dcount, 51, inbuf->emh.p2);
       return;
     }
     subs = calloc( 1, sizeof( e_subscription_t));
@@ -1814,6 +1871,7 @@ void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
   //          SID: server id (as sent to us)
   //          CID: client id (as sent to us)
   //
+
   create_message( r, 12, 0, 0, 0, sid, cid);
   inbuf->active--;
 }
@@ -1968,7 +2026,6 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   version = inbuf->emh.p2;
 
 
-
   if( inbuf->host_name == NULL)
     inbuf->host_name = strdup("");
   if( inbuf->user_name == NULL)
@@ -1976,14 +2033,8 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   cidn = htonl( cid);
   versionn = htonl( version);
 
-  fprintf( stderr, "Create Chan with name '%s' for user '%s' on machine '%s'\n", inbuf->payload, inbuf->user_name, inbuf->host_name);
+  fprintf( stderr, "Create Chan with name '%s' for user '%s' on machine '%s' and socket %d with cid %d\n", inbuf->payload, inbuf->user_name, inbuf->host_name, inbuf->sock, cid);
 
-
-  // ignore requests outside of our private network
-  //
-  if( (r->peer.sin_addr.s_addr | ournetmask_addr.s_addr) != ournetmask_addr.s_addr)
-    return;
-    
   entry_in.key = inbuf->payload;
   entry_outp = hsearch( entry_in, FIND);
   if( entry_outp != NULL && entry_outp->data != NULL) {
@@ -1997,6 +2048,9 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
     chans->subs     = NULL;
     chans->next     = kvpp->chans;
     kvpp->chans     = chans;
+
+    r->bufsize = sizeof( *h1) * 3;
+    r->buf = calloc( 1, r->bufsize);
 
     h1 = (e_message_header_t *)r->buf;
     h2 = h1 + 1;
@@ -2362,8 +2416,12 @@ void (*cmds[])(e_socks_buffer_t *, e_response_t *) = {
 void fixup_bps( e_socks_buffer_t *b) {
   int nbytes;
 
-  if( b==NULL || b->buf==NULL) {
+  if( b==NULL) {
     fprintf( stderr, "Bad buffer pointer (why?) (fixup_bps)\n");
+    return;
+  }
+  if( b->buf==NULL) {
+    fprintf( stderr, "Bad buffer->buf pointer (why?) (fixup_bps)\n");
     return;
   }
   if( b->wbp < b->rbp) {
@@ -2447,6 +2505,7 @@ void ca_service( struct pollfd *pfd) {
     // close the socket and ignore it ever more
     //
     inbuf->active = 0;
+
     return;
   }
 
@@ -2462,10 +2521,16 @@ void ca_service( struct pollfd *pfd) {
     if( inbuf->reply_q != NULL) {
       next = inbuf->reply_q;
 
+
       if( next->fromlen != 0) {
+	//	fprintf( stderr, "To %s port %d write %d bytes\n", inet_ntoa( next->fromaddr.sin_addr), ntohs( next->fromaddr.sin_port), next->reply_size);
+	//	hex_dump( next->reply_size, next->reply_packet);
 	sent_count = sendto( pfd->fd, next->reply_packet, next->reply_size, 0, (const struct sockaddr *)&next->fromaddr, next->fromlen);
       } else {
 	sent_count = send( pfd->fd, next->reply_packet, next->reply_size, 0);
+      }
+      if( inbuf->active == 0) {
+	e_socks_buf_close( inbuf);
       }
       if( sent_count == -1) {
 	fprintf( stderr, "fromlen: %d     fromaddr: %s\n", next->fromlen, inet_ntoa( next->fromaddr.sin_addr));
@@ -2474,6 +2539,7 @@ void ca_service( struct pollfd *pfd) {
 	  hex_dump( next->reply_size, next->reply_packet);
 	} else {
 	  inbuf->active = 0;
+	  e_socks_buf_close( inbuf);
 	}
 	inbuf->reply_q = next->next;
 	free( next->reply_packet);
@@ -2484,6 +2550,7 @@ void ca_service( struct pollfd *pfd) {
       if( sent_count == 0) {
 	fprintf( stderr, "(ca_service) possible bad connect, cutting out\n");
 	inbuf->active = 0;
+	e_socks_buf_close( inbuf);
 	return;
       }
 
@@ -2505,7 +2572,7 @@ void ca_service( struct pollfd *pfd) {
     }
   }
 
-  if( pfd->revents & POLLIN) {
+  if( inbuf->active != 0 && (pfd->revents & POLLIN) != 0) {
 
     fixup_bps( inbuf);
 
@@ -2517,16 +2584,23 @@ void ca_service( struct pollfd *pfd) {
       //
       return;
     }
-    inbuf->wbp += nread;
 
     // fprintf( stderr, "From %s port %d read %d bytes\n", inet_ntoa( fromaddr.sin_addr), ntohs(fromaddr.sin_port), nread);
+    //    hex_dump( nread, inbuf->wbp);
+
+    inbuf->wbp += nread;
+
 
     nert = 0;
     while( inbuf->rbp < inbuf->wbp) {
 
+
       old_rbp = inbuf->rbp;
       read_extended_message_header( inbuf);
       cmd = inbuf->emh.cmd;
+
+      //      fprintf( stderr, "main: nert = %d, cmd = %d\n", nert, cmd);
+
       if( cmd <0 || cmd > 27) {
 	//
 	// Bad command: either a protocol version problem or we have a messed up packet.
@@ -2658,6 +2732,7 @@ e_kvpair_t *related_kvpair( e_kvpair_t *parent, char *related) {
 
 void update_ht() {
   static int kv_name_col, kv_value_col, kv_seq_col, kv_dbr_col, kv_epoch_secs_col, kv_epoch_nsecs_col, first_time=1;
+  e_response_t ert;
   void *params[1];
   int param_lengths[1];
   int param_formats[1];
@@ -2667,6 +2742,10 @@ void update_ht() {
   int i;
   e_kvpair_t *kvpp, *array_length_kvpp;
   e_array_t  *an_array;
+  e_channel_t *chans;
+  e_subscription_t *subs;
+  int struct_size, data_size;
+  void *payload;
 
   nseq = htonl( ht_seq);
   params[0] = &nseq;	param_lengths[0] = sizeof(nseq);	param_formats[0] = 1;
@@ -2702,16 +2781,37 @@ void update_ht() {
       kvpp = entry_outp->data;
       if( kvpp->kvvalue != NULL)
 	free( kvpp->kvvalue);
-      kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_name_col));
+      kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
       kvpp->kvseq          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_seq_col));
       kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
       kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
 
-      
+      for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
+	for( subs = chans->subs; subs != NULL; subs = subs->next) {
+	  //
+	  // create a message
 
+	  struct_size = dbr_sizes[subs->dtype].dbr_struct_size;
+	  data_size   = dbr_sizes[subs->dtype].dbr_type_size;
+
+	  payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
+	  // struct filling would go here if we did it
+	  mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
+	  payload += struct_size;
+	  pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
+
+	  //    fprintf( stderr, "update_ht hex_dump:\n");
+	  //    hex_dump( ert.bufsize, ert.buf);
+
+	  if( ert.buf != NULL && ert.bufsize > 0) {
+	    mk_reply( find_e_socks_buffer( chans->sock), ert.bufsize, ert.buf, NULL, 0);
+	  }
+	}
+      }
     } else {
       //
       // Add this one
+      // Since we are adding this now there is no possiblity that we need to notify a channel subscriber
       //
       kvpp = calloc( 1, sizeof( e_kvpair_t));
       if( kvpp == NULL) {
@@ -2719,7 +2819,7 @@ void update_ht() {
 	exit( 1);
       }
       kvpp->kvname         = strdup( PQgetvalue( pgr, i, kv_name_col));
-      kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_name_col));
+      kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
       kvpp->kvseq          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_seq_col));
       kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
       kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
@@ -2865,7 +2965,6 @@ void broadcast_beacon( int sig) {
   create_message( &ert, 13, 0, 5064, 0, beaconid++, tmp);
   mk_reply( e_sock_bufs + beacon_index, ert.bufsize, ert.buf, &broadcastaddr, sizeof( broadcastaddr));
 
-  update_ht();
 }
 
 
@@ -2879,6 +2978,7 @@ int main( int argc, char **argv) {
   static struct sigaction alarm_action; // sets up alarm signal function
   static struct itimerval timer_interval;
   static sigset_t emptyset, blockset;		// signal masks
+  struct timespec update_timeout, now, last;
   int err;				// error return from bind
   int i;				// loop for poll response and sockets
   int nfds;				// number of active file descriptors from poll
@@ -2978,6 +3078,8 @@ int main( int argc, char **argv) {
   // TCP Virtual Circuits
   //
   vclistener = socket( PF_INET, SOCK_STREAM, 0);
+  fprintf( stderr, "vclistener socket: %d\n", vclistener);
+
   if( vclistener == -1) {
     fprintf( stderr, "Could not create virtual circuit listener socket\n");
     exit( -1);
@@ -3031,13 +3133,14 @@ int main( int argc, char **argv) {
   //
   timer_interval.it_interval.tv_sec  = 0;
   timer_interval.it_interval.tv_usec = 200000;
-  timer_interval.it_value.tv_sec     = 5;
-  timer_interval.it_value.tv_usec    = 0;
+  timer_interval.it_value.tv_sec     = 0;
+  timer_interval.it_value.tv_usec    = 500000;
 
   if( setitimer( ITIMER_REAL, &timer_interval, NULL) == -1) {
     perror( "timer initialization");
   }
 
+  clock_gettime( CLOCK_REALTIME, &last);
 
   fprintf( stderr, "initialization complete\n");
   while( 1) {
@@ -3045,7 +3148,7 @@ int main( int argc, char **argv) {
     //
     // Fill up the fd array
     // Ignore stdin, stdout, stderr
-    for( i=0, sock=3; sock<e_max_socket_number; sock++) {
+    for( i=0, sock=3; sock<=e_max_socket_number; sock++) {
       e_socks_buffer_t *sbuff;
 
       sbuff = find_e_socks_buffer( sock);
@@ -3057,17 +3160,18 @@ int main( int argc, char **argv) {
 
       if( sbuff->reply_q != NULL) {
 	e_socks[i].events |= POLLOUT;
-	fprintf( stderr, "main: pollout set for socket %d\n", sock);
       }
       i++;
     }
     n_e_socks = i;
 
+    update_timeout.tv_sec  = 0;
+    update_timeout.tv_nsec = 500000000;
     //
     // unblock alarm signal and wait for file descriptors
     //
     sigemptyset( &emptyset);
-    nfds = ppoll( e_socks, n_e_socks, NULL, &emptyset);
+    nfds = ppoll( e_socks, n_e_socks, &update_timeout, &emptyset);
 
     //
     // Check for active descriptors
@@ -3090,6 +3194,9 @@ int main( int argc, char **argv) {
 	}
       }
     }
+    clock_gettime( CLOCK_REALTIME, &now);
+    if( (now.tv_sec - last.tv_sec + (now.tv_nsec - last.tv_nsec)/1.e9) >= 0.5)
+      update_ht();
   }
   return 0;
 }

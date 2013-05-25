@@ -15,6 +15,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <search.h>
+#include <ctype.h>
+#include <time.h>
 
 // For some reason epics uses fixed length strings
 // Sort of: epics strings are defined as a struct { unsigned length; char *pString}
@@ -114,7 +116,7 @@ typedef struct e_channel_struct {
 typedef struct e_array_struct {
   struct e_array_struct *next;			// the next element
   struct e_kvpair_struct *name;			// the name kvpair
-  struct e_kvpair_struct *position;			// the position kvpair
+  struct e_kvpair_struct *position;		// the position kvpair
   uint32_t index;				// the index of this item
 } e_array_t;
 
