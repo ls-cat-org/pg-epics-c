@@ -909,7 +909,7 @@ void pack_dbr_data( void *pp, int dtype, char *svalue) {
   case 28:
     strcpy( pp, svalue);
     //
-    // IF CA clients die when we give them full sized strings the
+    // IF CA clients die when we give them full sized strings then
     // this will need to be changed to
     // strncpy( pp, svalue, MAX_STRING_SIZE-1);
     // Implicit null termination 'cause we used calloc
@@ -2779,32 +2779,43 @@ void update_ht() {
       // Update this one
       //
       kvpp = entry_outp->data;
-      if( kvpp->kvvalue != NULL)
-	free( kvpp->kvvalue);
-      kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
-      kvpp->kvseq          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_seq_col));
-      kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
-      kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
+      //
+      // Unless it has the same value
+      //
+      if( strcmp( kvpp->kvvalue, PQgetvalue( pgr, i, kv_value_col)) != 0) {
 
-      for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
-	for( subs = chans->subs; subs != NULL; subs = subs->next) {
-	  //
-	  // create a message
+	if( kvpp->kvvalue != NULL)
+	  free( kvpp->kvvalue);
+	kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
+	kvpp->kvseq          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_seq_col));
+	kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
+	kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
 
-	  struct_size = dbr_sizes[subs->dtype].dbr_struct_size;
-	  data_size   = dbr_sizes[subs->dtype].dbr_type_size;
+	//
+	// Notify the subscribers
+	//
+	for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
+	  for( subs = chans->subs; subs != NULL; subs = subs->next) {
+	    //
+	    // create a message
 
-	  payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
-	  // struct filling would go here if we did it
-	  mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
-	  payload += struct_size;
-	  pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
+	    struct_size = dbr_sizes[subs->dtype].dbr_struct_size;
+	    data_size   = dbr_sizes[subs->dtype].dbr_type_size;
+	    if( data_size == 0)
+	      data_size = strlen( kvpp->kvvalue)+1;
 
-	  //    fprintf( stderr, "update_ht hex_dump:\n");
-	  //    hex_dump( ert.bufsize, ert.buf);
+	    payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
+	    // struct filling would go here if we did it
+	    mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
+	    payload += struct_size;
+	    pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
 
-	  if( ert.buf != NULL && ert.bufsize > 0) {
-	    mk_reply( find_e_socks_buffer( chans->sock), ert.bufsize, ert.buf, NULL, 0);
+	    //    fprintf( stderr, "update_ht hex_dump:\n");
+	    //    hex_dump( ert.bufsize, ert.buf);
+
+	    if( ert.buf != NULL && ert.bufsize > 0) {
+	      mk_reply( find_e_socks_buffer( chans->sock), ert.bufsize, ert.buf, NULL, 0);
+	    }
 	  }
 	}
       }
