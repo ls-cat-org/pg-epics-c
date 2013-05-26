@@ -2995,7 +2995,7 @@ int main( int argc, char **argv) {
   int nfds;				// number of active file descriptors from poll
   int flags;				// used to set non-blocking io for vclistener
   int opt_param;			// setsockot parameter
-
+  int run_update_ht;			// flag indicating we have un serviced notifies pending on the DB
 
 
   fprintf( stderr, "initialization starting\n");
@@ -3019,6 +3019,7 @@ int main( int argc, char **argv) {
   //
   hcreate( ht_max_size);
   update_ht();
+  run_update_ht = 0;
 
   //
   // UDP comms
@@ -3177,7 +3178,7 @@ int main( int argc, char **argv) {
     n_e_socks = i;
 
     update_timeout.tv_sec  = 0;
-    update_timeout.tv_nsec = 500000000;
+    update_timeout.tv_nsec = 200000000;
     //
     // unblock alarm signal and wait for file descriptors
     //
@@ -3196,18 +3197,43 @@ int main( int argc, char **argv) {
 	} else if( e_socks[i].fd == PQsocket(q)) {
 	  //
 	  // The only thing that would come over the pg socket
-	  // would be a notify about a monitor update (which we ignore).
+	  // would be a notify about a monitor update.
 	  //
 	  PQconsumeInput( q);
 	  while( PQnotifies( q) != NULL);
+
+	  //
+	  // Update from postgresql, but not too often.
+	  // This is to keep unruly KV pairs from beating up the database server too badly
+	  //
+	  clock_gettime( CLOCK_REALTIME, &now);
+	  if( (now.tv_sec - last.tv_sec + (now.tv_nsec - last.tv_nsec)/1.e9) >= 0.2) {
+	    update_ht();
+	    last.tv_sec  = now.tv_sec;
+	    last.tv_nsec = now.tv_nsec;
+	    run_update_ht = 0;
+	  } else {
+	    run_update_ht = 1;
+	  }
 	} else {
 	  ca_service( e_socks+i);
 	}
       }
     }
-    clock_gettime( CLOCK_REALTIME, &now);
-    if( (now.tv_sec - last.tv_sec + (now.tv_nsec - last.tv_nsec)/1.e9) >= 0.5)
-      update_ht();
+
+    //
+    // This is for when a notify came but we had just serviced the database.
+    // We get to it eventually but keep from putting too big a load on the server.
+    //
+    if( run_update_ht) {
+      clock_gettime( CLOCK_REALTIME, &now);
+      if( (now.tv_sec - last.tv_sec + (now.tv_nsec - last.tv_nsec)/1.e9) >= 0.2) {
+	update_ht();
+	last.tv_sec  = now.tv_sec;
+	last.tv_nsec = now.tv_nsec;
+	run_update_ht = 0;
+      }
+    }
   }
   return 0;
 }
