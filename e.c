@@ -1345,7 +1345,7 @@ void cmd_ca_proto_version( e_socks_buffer_t *inbuf, e_response_t *r) {
 void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint16_t *tmp;
   uint32_t sid;
-  uint32_t cid;
+  uint32_t subid;
   char sid_key[9];
   ENTRY entry_in, *entry_outp;
   e_kvpair_t *kvpp;
@@ -1354,8 +1354,8 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
 
   tmp = (uint16_t *)(inbuf->payload + 12);	// skip 3 obsolete 32 bit float values
 
-  sid = inbuf->emh.p1;
-  cid = inbuf->emh.p2;
+  sid   = inbuf->emh.p1;
+  subid = inbuf->emh.p2;
 
   sprintf( sid_key, "%08x", sid);
 
@@ -1365,11 +1365,11 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
   if( entry_outp != NULL && entry_outp->data != NULL) {
     kvpp = entry_outp->data;
     for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
-      if( chans->sock == inbuf->sock && chans->cid == cid)
+      if( chans->sock == inbuf->sock)
 	break;
     }
     if( chans == NULL) {
-      fprintf( stderr, "cmd_ca_proto_event_add: no channel found for socket %d and cid %d\n", inbuf->sock, cid);
+      fprintf( stderr, "cmd_ca_proto_event_add: no channel found for socket %d, subid %d, and sid %d\n", inbuf->sock, subid, sid);
       //
       // Signal a bad channel id
       //
@@ -1380,7 +1380,7 @@ void cmd_ca_proto_event_add( e_socks_buffer_t *inbuf, e_response_t *r) {
     subs->dtype  = inbuf->emh.dtype;
     subs->dcount = inbuf->emh.dcount;
     subs->mask   = *tmp;
-    subs->subid  = inbuf->emh.p2;
+    subs->subid  = subid;
     subs->next   = chans->subs;
     chans->subs  = subs;
 
@@ -1696,7 +1696,7 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
   if( foundIt) {
     uint16_t server_protocol_version = 11, *spvp;
 
-    fprintf( stderr, "cmd_ca_proto_search: found channel %s  socket=%d\n", pl, inbuf->sock);
+    fprintf( stderr, "cmd_ca_proto_search: found channel %s  socket=%d  cid=%d\n", pl, inbuf->sock, cid);
     // Response
     //
     //          cmd: 6
@@ -2034,6 +2034,8 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
   versionn = htonl( version);
 
   fprintf( stderr, "Create Chan with name '%s' for user '%s' on machine '%s' and socket %d with cid %d\n", inbuf->payload, inbuf->user_name, inbuf->host_name, inbuf->sock, cid);
+
+  
 
   entry_in.key = inbuf->payload;
   entry_outp = hsearch( entry_in, FIND);
@@ -2831,6 +2833,7 @@ void update_ht() {
       }
       kvpp->kvname         = strdup( PQgetvalue( pgr, i, kv_name_col));
       kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
+      kvpp->dbr_type       = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_dbr_col));
       kvpp->kvseq          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_seq_col));
       kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
       kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
