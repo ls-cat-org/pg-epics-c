@@ -180,6 +180,14 @@ int e_socks_buf_init( int sock) {
 	e_sock_bufs[j].buf = NULL;
 	e_sock_bufs[j].bufsize = 0;
       }
+      if( e_sock_bufs[j].host_name != NULL) {
+	free( e_sock_bufs[j].host_name);
+	e_sock_bufs[j].host_name = NULL;
+      }
+      if( e_sock_bufs[j].user_name != NULL) {
+	free( e_sock_bufs[j].user_name);
+	e_sock_bufs[j].user_name = NULL;
+      }
       break;
     }
   }
@@ -1566,18 +1574,7 @@ void cmd_ca_proto_read( e_socks_buffer_t *inbuf, e_response_t *r) {
   //  printf( "Proto Read\n");
 }
 
-/** Write a new channel value
- *
- *          cmd: 4
- * payload size: size of dbr formatted data
- *    data type: dbr type of the data
- *   data count: number of elemets
- *          SID: server channel identifier
- *         IOID: client's identifer of this request
- *
- * tcp
- */
-void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
+int ca_proto_write_common( e_socks_buffer_t *inbuf, e_response_t *r) {
   void *params[3];
   int param_lengths[3];
   int param_formats[3];
@@ -1591,11 +1588,12 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   char sid_key[9];
   ENTRY entry_in, *entry_outp;
   e_kvpair_t *kvpp;
+  int rtn_value;
 
-  sid = inbuf->emh.p1;
-  ioid = inbuf->emh.p2;
+  sid               = inbuf->emh.p1;
+  ioid              = inbuf->emh.p2;
   inbuf->emh.dcount = 1;	// hold the arrays
-
+  rtn_value         = 160;
   //
   // Look up the kv pair
   //
@@ -1604,7 +1602,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   entry_outp = hsearch( entry_in, FIND);
   if( entry_outp == NULL || entry_outp->data == NULL) {
     fprintf( stderr, "cmd_ca_proto_write: could not find server ID %d\n", sid);
-    return;
+    return rtn_value;
   }
   kvpp   = entry_outp->data;
   nkvkey = htonl(kvpp->kvkey);
@@ -1633,7 +1631,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     if( inbuf->payload + s_size > inbuf->wbp) {
       fprintf( stderr, "Bad string detected (cmd_ca_proto_write)\n");
       inbuf->rbp = inbuf->wbp;
-      return;
+      return rtn_value;
     }
     inbuf->payload += s_size + 1;
     break;
@@ -1727,10 +1725,28 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
     params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
     pgr = e_execPrepared( "set_value", 2, (const char **)params, param_lengths, param_formats, 0);
     if( pgr == NULL)
-      return;
-    PQclear( pgr);
+      return rtn_value;
 
+    rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
+    PQclear( pgr);
   }
+
+  return rtn_value;
+}
+
+/** Write a new channel value
+ *
+ *          cmd: 4
+ * payload size: size of dbr formatted data
+ *    data type: dbr type of the data
+ *   data count: number of elemets
+ *          SID: server channel identifier
+ *         IOID: client's identifer of this request
+ *
+ * tcp
+ */
+void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
+  ca_proto_write_common( inbuf, r);
 }
 
 /** Obsolete function unsupported here
@@ -1959,14 +1975,23 @@ void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
     }
     last_chan = chans;
   }
+
   if( chans != NULL) {
     if( last_chan == NULL)
       kvpp->chans = NULL;
     else
       last_chan->next = chans->next;
+    if( chans->hostname != NULL) {
+      free( chans->hostname);
+      chans->hostname = NULL;
+    }
+    if( chans->username != NULL) {
+      free( chans->username);
+      chans->username = NULL;
+    }
+
     free( chans);
   }
-
   //
   // The client does nothing with this message: it's just noise.
   //
@@ -2230,176 +2255,18 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
  * tcp
  */
 void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
-  void *params[3];
-  int param_lengths[3];
-  int param_formats[3];
-  uint32_t struct_size;
-  uint32_t data_size;
-  PGresult *pgr;
-  uint32_t dbr_type;
-  uint32_t ioid, sid, nkvkey;
-  int rtn;
-  char s[128];
-  char *sp;
-  int s_size;
+  uint32_t ioid;
   int rtn_value;
-  ENTRY entry_in, *entry_outp;
-  char sid_key[9];
-  e_kvpair_t *kvpp;
 
   
-  sid = inbuf->emh.p1;
+
   ioid = inbuf->emh.p2;
-  inbuf->emh.dcount = 1;	// hold the arrays
-
-  sprintf( sid_key, "%08x", sid);
-  entry_in.key = sid_key;
-  entry_outp = hsearch( entry_in, FIND);
-
-  if( entry_outp == NULL) {
-    fprintf( stderr, "cmd_ca_proto_write_notify: could not find server ID %d\n", sid);
-    //
-    // Response
-    //
-    //           cmd: 19
-    //  payload size:  0
-    //     data type: same as request
-    //   data length: same as request
-    //   status code: ECA_NORMAL (1)  or ECA_PUTFAIL (160)
-    //          IOID: from client
-    //
-    create_message( r, 19, 0, inbuf->emh.dtype, inbuf->emh.dcount, ntohl( 160), ioid);
-    return;
-  }
-
-  kvpp = entry_outp->data;
-  nkvkey = htonl(kvpp->kvkey);
-  
-  //
-  // Discover our data size
-  //
-  dbr_type = htonl(inbuf->emh.dtype);
-  struct_size = dbr_sizes[inbuf->emh.dtype].dbr_struct_size;
-  data_size   = dbr_sizes[inbuf->emh.dtype].dbr_type_size;
-
-  rtn = 160;	// default ca put fail
-  printf( "Proto Write Notify\n");
-
 
   //
-  // TO DO:
-  // add proper array support
+  // The only difference between us and cmd 4 (cmd_ca_proto_write) is the response, so we just add that
   //
-  switch( inbuf->emh.dtype) {
+  rtn_value = ca_proto_write_common( inbuf, r);
 
-  case  0:	// string
-  case  7:
-  case 14:
-  case 21:
-  case 28:
-    sp = inbuf->payload;
-    s_size = strlen( sp)+1;
-    printf( "Proto Write Notify:  String %s\n", sp);
-    if( inbuf->payload + s_size > inbuf->wbp) {
-      fprintf( stderr, "Bad string detected (cmd_ca_proto_write)\n");
-      inbuf->rbp = inbuf->wbp;
-      return;
-    }
-    inbuf->payload += s_size + 1;
-    break;
-
-  case  1:	// int (16 bit)
-  case  8:
-  case 15:
-  case 22:
-  case 29:
-    snprintf( s, sizeof( s)-1, "%d", ntohs(*(int16_t *)(inbuf->payload)));
-    s[sizeof(s)-1] = 0;
-    sp = s;
-    printf( "Proto Write Notify:  16 bit int %s\n", s);
-    inbuf->payload += 2;
-    break;
-
-  case  2:	// float (32 bit)
-  case  9:
-  case 16:
-  case 23:
-  case 30:
-    {
-      uint32_t tmp;
-      tmp = ntohs( *(uint32_t *)(inbuf->payload));
-      snprintf( s, sizeof( s)-1, "%f", *(float *)&tmp);
-      s[sizeof(s)-1] = 0;
-      sp = s;
-      printf( "Proto Write Notify:  32 bit float %s\n", s);
-      inbuf->payload += 4;
-    }
-    break;
-
-  case  3:	// enum (16 bit unsigned int)
-  case 10:
-  case 17:
-  case 24:
-  case 31:
-    snprintf( s, sizeof( s)-1, "%u", ntohs(*(uint16_t *)(inbuf->payload)));
-    s[sizeof(s)-1] = 0;
-    sp = s;
-    printf( "Proto Write Notify:  enum: %s\n", s);
-    inbuf->payload += 2;
-    break;
-
-  case  4:	// enum (8 bit unsigned int)
-  case 11:
-  case 18:
-  case 25:
-  case 32:
-    snprintf( s, sizeof( s)-1, "%u", *(unsigned char *)(inbuf->payload));
-    s[sizeof(s)-1] = 0;
-    sp = s;
-    printf( "Proto Write Notify:  8 bit int %s\n", s);
-    inbuf->payload += 1;
-    break;
-
-  case  5:	// enum (32 bit signed int)
-  case 12:
-  case 19:
-  case 26:
-  case 33:
-    snprintf( s, sizeof( s)-1, "%d", ntohl( *(int32_t *)(inbuf->payload)));
-    s[sizeof(s)-1] = 0;
-    sp = s;
-    printf( "Proto Write Notify:  32 bit int %s\n", s);
-    inbuf->payload += 4;
-    break;
-
-  case  6:	// double (64 bit)
-  case 13:
-  case 20:
-  case 27:
-  case 34:
-    snprintf( s, sizeof( s)-1, "%f", unswapd( *(long long *)(inbuf->payload)));
-    s[sizeof(s)-1] = 0;
-    sp = s;
-    printf( "Proto Write Notify:  64 bit double %s\n", s);
-    inbuf->payload += 8;
-    break;
-  }
-
-  if( strcmp( kvpp->kvvalue, sp) != 0) {
-    if( kvpp->kvvalue != NULL)
-      free( kvpp->kvvalue);
-    kvpp->kvvalue        = strdup( sp);
-    
-    notify_subscribers( kvpp);
-  }
-
-  params[0] = &nkvkey;	        param_lengths[0] = sizeof(nkvkey);	param_formats[0] = 1;
-  params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
-  pgr = e_execPrepared( "set_value", 2, (const char **)params, param_lengths, param_formats, 0);
-  if( pgr == NULL)
-    return;
-  rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
-  PQclear( pgr);
 
   //
   // Response
@@ -2680,7 +2547,7 @@ void ca_service( struct pollfd *pfd) {
     // close the socket and ignore it ever more
     //
     inbuf->active = 0;
-
+    e_socks_buf_close( inbuf);
     return;
   }
 
@@ -2723,7 +2590,7 @@ void ca_service( struct pollfd *pfd) {
       }
 
       if( sent_count == 0) {
-	fprintf( stderr, "(ca_service) possible bad connect, cutting out\n");
+	fprintf( stderr, "(ca_service) possible bad connection, cutting out\n");
 	inbuf->active = 0;
 	e_socks_buf_close( inbuf);
 	return;
@@ -2859,26 +2726,29 @@ void vclistener_service( struct pollfd *pfd) {
   static e_socks_buffer_t *inbuf = NULL;	// our socket buffer
   int newsock;
   
-  if( inbuf == NULL) {
-    inbuf = find_e_socks_buffer( pfd->fd);
+  if( pfd->revents & POLLIN) {
     if( inbuf == NULL) {
-      fprintf( stderr, "vclistener_service: could not find buffer for socket %d\n", pfd->fd);
+      inbuf = find_e_socks_buffer( pfd->fd);
+      if( inbuf == NULL) {
+	fprintf( stderr, "vclistener_service: could not find buffer for socket %d\n", pfd->fd);
+	return;
+      }
+    }
+
+    fromlen = sizeof( fromaddr);
+    newsock = accept( pfd->fd, (struct sockaddr *)&fromaddr, (unsigned int *)&fromlen);
+
+    fprintf( stderr, "accepted socket %d from %s (vclistener_service)\n", newsock, inet_ntoa( fromaddr.sin_addr));
+
+    if( newsock < 0) {
+      perror( "vclistener_service");
       return;
     }
-  }
-
-  fromlen = sizeof( fromaddr);
-  newsock = accept( pfd->fd, (struct sockaddr *)&fromaddr, (unsigned int *)&fromlen);
-
-  fprintf( stderr, "accepted socket %d from %s (vclistener_service)\n", newsock, inet_ntoa( fromaddr.sin_addr));
-
-  if( newsock < 0) {
-    return;
-  }
-  if( n_e_socks < n_e_socks_max) {
-    e_socks_buf_init( newsock);
-  } else {
-    fprintf( stderr, "vclistener: too many sockets open (%d) to open another\n", n_e_socks);
+    if( n_e_socks < n_e_socks_max) {
+      e_socks_buf_init( newsock);
+    } else {
+      fprintf( stderr, "vclistener: too many sockets open (%d) to open another\n", n_e_socks);
+    }
   }
 }
 
