@@ -30,7 +30,7 @@ static PGconn *q = NULL;					//!< Our connection to the postgresql server
  *  saved as prepared statements on the server to cut execution time
  */
 char* prepared_statements[] = {
-  "prepare set_str_value (int,text) as select e.set_str_value($1,$2) as rtn",
+  "prepare set_value (int,text) as select e.set_value($1,$2) as rtn",
   "prepare getkvs (int) as select * from e.getkvs( $1)"
 };
 
@@ -96,6 +96,34 @@ e_socks_buffer_t *find_e_socks_buffer( int sock) {
   }
   return e_sock_bufs + buf_index;
 }
+
+
+
+/** See if this is a .DESC field
+ */
+int is_desc( char *p) {
+  char *q, *q1, *q2;
+  int rtn;
+    
+  rtn = 0;
+  q = strdup( p);
+
+  // Find the end of the string
+  for( q2 = q; q2 && *q2; q2++);
+
+  // Reverse it
+  for( q1 = q, q2--; q2 > q1; q2--, q1++)
+    *q1 ^= *q2,
+      *q2 ^= *q1,
+      *q1 ^= *q2;
+
+  if( strstr( q, "CSED.") == q) {
+    rtn = 1;
+  }
+  free( q);
+  return rtn;
+}
+
 
 
 
@@ -1296,6 +1324,82 @@ void read_extended_message_header( e_socks_buffer_t *inbuf) {
 }
 
 
+/** make up the reply packet
+ *
+ * \param inbuf      the buffer this is a reponse to
+ * \param rsize      size of the reply packet
+ * \param reply      The reply packet
+ * \param fromaddrp  Our from address
+ * \param fromlen    Length of our from address
+ */
+void mk_reply( e_socks_buffer_t *inbuf, int rsize, char *reply, struct sockaddr_in *fromaddrp, int fromlen) {
+  e_reply_queue_t *our_reply;
+  e_reply_queue_t *last_reply;		// points to the last reply in the queue
+
+  our_reply = calloc( sizeof( *our_reply), 1);
+  if( our_reply == NULL) {
+    fprintf( stderr, "Out of memory for our_reply (mk_reply)\n");
+    exit( -1);
+  }
+  our_reply->next         = NULL;
+  our_reply->reply_size   = rsize;
+  our_reply->reply_packet = reply;
+
+  our_reply->fromlen      = fromlen;
+  if( fromlen > 0) {
+    our_reply->fromaddr   = *fromaddrp;
+  }
+
+  //
+  // Add reply to the end of the queue
+  // We'd support packet priorities here, I suppose
+  //
+  if( inbuf->reply_q == NULL)
+    inbuf->reply_q = our_reply;
+  else {
+    for( last_reply=inbuf->reply_q; last_reply->next != NULL; last_reply=last_reply->next);
+    last_reply->next = our_reply;
+  }
+}
+
+
+/** Notify channel subscribers
+ */
+void notify_subscribers( e_kvpair_t *kvpp) {
+  e_response_t ert;
+  e_channel_t *chans;
+  e_subscription_t *subs;
+  int struct_size, data_size;
+  void *payload;
+
+  //
+  // Notify the subscribers
+  //
+  for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
+    for( subs = chans->subs; subs != NULL; subs = subs->next) {
+      //
+      // create a message
+
+      struct_size = dbr_sizes[subs->dtype].dbr_struct_size;
+      data_size   = dbr_sizes[subs->dtype].dbr_type_size;
+      if( data_size == 0)
+	data_size = strlen( kvpp->kvvalue)+1;
+
+      payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
+      // struct filling would go here if we did it
+      mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
+      payload += struct_size;
+      pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
+
+      //    fprintf( stderr, "notify_subscribers hex_dump:\n");
+      //    hex_dump( ert.bufsize, ert.buf);
+
+      if( ert.buf != NULL && ert.bufsize > 0) {
+	mk_reply( find_e_socks_buffer( chans->sock), ert.bufsize, ert.buf, NULL, 0);
+      }
+    }
+  }
+}
 
 
 /** Exchange client and server protocol version numbers
@@ -1482,16 +1586,31 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   char *sp;
   PGresult *pgr;
   uint32_t dbr_type;
-  uint32_t ioid, sid, nsid;
+  uint32_t ioid, sid, nkvkey;
   char s[128];
+  char sid_key[9];
+  ENTRY entry_in, *entry_outp;
+  e_kvpair_t *kvpp;
 
   sid = inbuf->emh.p1;
-  nsid = htonl(sid);
   ioid = inbuf->emh.p2;
   inbuf->emh.dcount = 1;	// hold the arrays
 
   //
-  // Discover our data size (shouldn't we just create an array at initiallizaion or compile time?...)
+  // Look up the kv pair
+  //
+  sprintf( sid_key, "%08x", sid);
+  entry_in.key = sid_key;
+  entry_outp = hsearch( entry_in, FIND);
+  if( entry_outp == NULL || entry_outp->data == NULL) {
+    fprintf( stderr, "cmd_ca_proto_write: could not find server ID %d\n", sid);
+    return;
+  }
+  kvpp   = entry_outp->data;
+  nkvkey = htonl(kvpp->kvkey);
+
+  //
+  // Discover our data size
   //
   dbr_type = htonl(inbuf->emh.dtype);
   struct_size = dbr_sizes[inbuf->emh.dtype].dbr_struct_size;
@@ -1499,7 +1618,7 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
 
   //
   // TO DO:
-  // add proper array support by implementing the postgresql/libpq array structures
+  // add proper array support
   //
   switch( inbuf->emh.dtype) {
 
@@ -1517,12 +1636,6 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
       return;
     }
     inbuf->payload += s_size + 1;
-    params[0] = &nsid;	        param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
-    params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    if( pgr == NULL)
-      return;
-    PQclear( pgr);
     break;
 
   case  1:	// int (16 bit)
@@ -1532,14 +1645,9 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 29:
     snprintf( s, sizeof( s)-1, "%d", ntohs(*(int16_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
+    sp = s;
     printf( "Proto Write:  16 bit int %s\n", s);
     inbuf->payload += 2;
-    params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-    params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    if( pgr == NULL)
-      return;
-    PQclear( pgr);
     break;
 
   case  2:	// float (32 bit)
@@ -1552,14 +1660,9 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
       tmp = ntohs( *(uint32_t *)(inbuf->payload));
       snprintf( s, sizeof( s)-1, "%f", *(float *)&tmp);
       s[sizeof(s)-1] = 0;
+      sp = s;
       printf( "Proto Write:  32 bit float %s\n", s);
       inbuf->payload += 4;
-      params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-      params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-      pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-      if( pgr == NULL)
-	return;
-      PQclear( pgr);
     }
     break;
 
@@ -1570,14 +1673,9 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 31:
     snprintf( s, sizeof( s)-1, "%u", ntohs(*(uint16_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
+    sp = s;
     printf( "Proto Write:  enum: %s\n", s);
     inbuf->payload += 2;
-    params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-    params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    if( pgr == NULL)
-      return;
-    PQclear( pgr);
     break;
 
   case  4:	// enum (8 bit unsigned int)
@@ -1587,14 +1685,9 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 32:
     snprintf( s, sizeof( s)-1, "%u", *(unsigned char *)(inbuf->payload));
     s[sizeof(s)-1] = 0;
+    sp = s;
     printf( "Proto Write:  8 bit int %s\n", s);
     inbuf->payload += 1;
-    params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-    params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    if( pgr == NULL)
-      return;
-    PQclear( pgr);
     break;
 
   case  5:	// enum (32 bit signed int)
@@ -1604,14 +1697,9 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 33:
     snprintf( s, sizeof( s)-1, "%d", ntohl( *(int32_t *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
+    sp = s;
     printf( "Proto Write:  32 bit int %s\n", s);
     inbuf->payload += 4;
-    params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-    params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
-    if( pgr == NULL)
-      return;
-    PQclear( pgr);
     break;
 
   case  6:	// double (64 bit)
@@ -1621,15 +1709,27 @@ void cmd_ca_proto_write( e_socks_buffer_t *inbuf, e_response_t *r) {
   case 34:
     snprintf( s, sizeof( s)-1, "%f", unswapd( *(long long *)(inbuf->payload)));
     s[sizeof(s)-1] = 0;
+    sp = s;
     printf( "Proto Write:  64 bit double %s\n", s);
     inbuf->payload += 8;
-    params[0] = &nsid;		param_lengths[0] = sizeof( nsid);	param_formats[0] = 1;
-    params[1] = s;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 0);
+    break;
+  }
+
+
+  if( strcmp( kvpp->kvvalue, sp) != 0) {
+    if( kvpp->kvvalue != NULL)
+      free( kvpp->kvvalue);
+    kvpp->kvvalue        = strdup( sp);
+
+    notify_subscribers( kvpp);
+    
+    params[0] = &nkvkey;	        param_lengths[0] = sizeof(nkvkey);	param_formats[0] = 1;
+    params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
+    pgr = e_execPrepared( "set_value", 2, (const char **)params, param_lengths, param_formats, 0);
     if( pgr == NULL)
       return;
     PQclear( pgr);
-    break;
+
   }
 }
 
@@ -1692,6 +1792,14 @@ void cmd_ca_proto_search( e_socks_buffer_t *inbuf, e_response_t *r) {
     else
       foundIt = 0;
   }
+
+  //
+  // See if the channel ends in ".DESC"
+  // If so, we pretend it exists.  Note that we can always add a DESC field to the DB
+  // in which case we've found it already
+  //
+  if( !foundIt && is_desc( pl))
+    foundIt = 1;
 
   if( foundIt) {
     uint16_t server_protocol_version = 11, *spvp;
@@ -2039,6 +2147,14 @@ void cmd_ca_proto_create_chan( e_socks_buffer_t *inbuf, e_response_t *r) {
 
   entry_in.key = inbuf->payload;
   entry_outp = hsearch( entry_in, FIND);
+  if( entry_outp == NULL && is_desc( inbuf->payload)) {
+    char *zz;
+    zz = strdup( "epics.DESC");
+    entry_in.key = zz;
+    entry_outp = hsearch( entry_in, FIND);
+    free( zz);
+  }
+
   if( entry_outp != NULL && entry_outp->data != NULL) {
     kvpp = entry_outp->data;
     chans = calloc( 1, sizeof( e_channel_t));
@@ -2121,8 +2237,9 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   uint32_t data_size;
   PGresult *pgr;
   uint32_t dbr_type;
-  uint32_t ioid, sid, nsid;
+  uint32_t ioid, sid, nkvkey;
   int rtn;
+  char s[128];
   char *sp;
   int s_size;
   int rtn_value;
@@ -2131,7 +2248,7 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   e_kvpair_t *kvpp;
 
   
-  sid  = inbuf->emh.p1;
+  sid = inbuf->emh.p1;
   ioid = inbuf->emh.p2;
   inbuf->emh.dcount = 1;	// hold the arrays
 
@@ -2139,15 +2256,24 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
   entry_in.key = sid_key;
   entry_outp = hsearch( entry_in, FIND);
 
-  //
-  // Unlike other routines we'll continue without a valid kvpp
-  // If postgres ends up creating a new kv pair then we'll add this soon to our hash table
-  //
-  if( entry_outp == NULL)
-    kvpp = NULL;
-  else
-    kvpp = entry_outp->data;
+  if( entry_outp == NULL) {
+    fprintf( stderr, "cmd_ca_proto_write_notify: could not find server ID %d\n", sid);
+    //
+    // Response
+    //
+    //           cmd: 19
+    //  payload size:  0
+    //     data type: same as request
+    //   data length: same as request
+    //   status code: ECA_NORMAL (1)  or ECA_PUTFAIL (160)
+    //          IOID: from client
+    //
+    create_message( r, 19, 0, inbuf->emh.dtype, inbuf->emh.dcount, ntohl( 160), ioid);
+    return;
+  }
 
+  kvpp = entry_outp->data;
+  nkvkey = htonl(kvpp->kvkey);
   
   //
   // Discover our data size
@@ -2162,35 +2288,119 @@ void cmd_ca_proto_write_notify( e_socks_buffer_t *inbuf, e_response_t *r) {
 
   //
   // TO DO:
-  // add proper array support by implementing the postgresql/libpq array structures
+  // add proper array support
   //
   switch( inbuf->emh.dtype) {
-  case 0:
+
+  case  0:	// string
+  case  7:
+  case 14:
+  case 21:
+  case 28:
     sp = inbuf->payload;
-    s_size = strlen( sp);
+    s_size = strlen( sp)+1;
+    printf( "Proto Write Notify:  String %s\n", sp);
     if( inbuf->payload + s_size > inbuf->wbp) {
-      fprintf( stderr, "Bad string detected (cmd_ca_proto_write_notify)\n");
+      fprintf( stderr, "Bad string detected (cmd_ca_proto_write)\n");
       inbuf->rbp = inbuf->wbp;
       return;
     }
+    inbuf->payload += s_size + 1;
+    break;
 
-    if( kvpp != NULL) {
-      if( strcmp( kvpp->kvvalue, sp) != 0) {
-	free( kvpp->kvvalue);
-	kvpp->kvvalue = strdup( sp);
-      }
+  case  1:	// int (16 bit)
+  case  8:
+  case 15:
+  case 22:
+  case 29:
+    snprintf( s, sizeof( s)-1, "%d", ntohs(*(int16_t *)(inbuf->payload)));
+    s[sizeof(s)-1] = 0;
+    sp = s;
+    printf( "Proto Write Notify:  16 bit int %s\n", s);
+    inbuf->payload += 2;
+    break;
+
+  case  2:	// float (32 bit)
+  case  9:
+  case 16:
+  case 23:
+  case 30:
+    {
+      uint32_t tmp;
+      tmp = ntohs( *(uint32_t *)(inbuf->payload));
+      snprintf( s, sizeof( s)-1, "%f", *(float *)&tmp);
+      s[sizeof(s)-1] = 0;
+      sp = s;
+      printf( "Proto Write Notify:  32 bit float %s\n", s);
+      inbuf->payload += 4;
     }
+    break;
 
-    inbuf->payload += s_size;
-    params[0] = &nsid;	param_lengths[0] = sizeof(nsid);	param_formats[0] = 1;
-    params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
-    pgr = e_execPrepared( "set_str_value", 2, (const char **)params, param_lengths, param_formats, 1);
-    if( pgr == NULL)
-      return;
-    rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
-    PQclear( pgr);
+  case  3:	// enum (16 bit unsigned int)
+  case 10:
+  case 17:
+  case 24:
+  case 31:
+    snprintf( s, sizeof( s)-1, "%u", ntohs(*(uint16_t *)(inbuf->payload)));
+    s[sizeof(s)-1] = 0;
+    sp = s;
+    printf( "Proto Write Notify:  enum: %s\n", s);
+    inbuf->payload += 2;
+    break;
+
+  case  4:	// enum (8 bit unsigned int)
+  case 11:
+  case 18:
+  case 25:
+  case 32:
+    snprintf( s, sizeof( s)-1, "%u", *(unsigned char *)(inbuf->payload));
+    s[sizeof(s)-1] = 0;
+    sp = s;
+    printf( "Proto Write Notify:  8 bit int %s\n", s);
+    inbuf->payload += 1;
+    break;
+
+  case  5:	// enum (32 bit signed int)
+  case 12:
+  case 19:
+  case 26:
+  case 33:
+    snprintf( s, sizeof( s)-1, "%d", ntohl( *(int32_t *)(inbuf->payload)));
+    s[sizeof(s)-1] = 0;
+    sp = s;
+    printf( "Proto Write Notify:  32 bit int %s\n", s);
+    inbuf->payload += 4;
+    break;
+
+  case  6:	// double (64 bit)
+  case 13:
+  case 20:
+  case 27:
+  case 34:
+    snprintf( s, sizeof( s)-1, "%f", unswapd( *(long long *)(inbuf->payload)));
+    s[sizeof(s)-1] = 0;
+    sp = s;
+    printf( "Proto Write Notify:  64 bit double %s\n", s);
+    inbuf->payload += 8;
+    break;
   }
-  nsid = htonl(sid);
+
+  if( strcmp( kvpp->kvvalue, sp) != 0) {
+    if( kvpp->kvvalue != NULL)
+      free( kvpp->kvvalue);
+    kvpp->kvvalue        = strdup( sp);
+    
+    notify_subscribers( kvpp);
+  }
+
+  params[0] = &nkvkey;	        param_lengths[0] = sizeof(nkvkey);	param_formats[0] = 1;
+  params[1] = sp;		param_lengths[1] = 0;			param_formats[1] = 0;
+  pgr = e_execPrepared( "set_value", 2, (const char **)params, param_lengths, param_formats, 0);
+  if( pgr == NULL)
+    return;
+  rtn_value = ntohl( *(uint32_t *)PQgetvalue( pgr, 0, PQfnumber( pgr, "rtn")));
+  PQclear( pgr);
+
   //
   // Response
   //
@@ -2436,43 +2646,6 @@ void fixup_bps( e_socks_buffer_t *b) {
   b->wbp = b->buf + nbytes;
 }
 
-/** make up the reply packet
- *
- * \param inbuf      the buffer this is a reponse to
- * \param rsize      size of the reply packet
- * \param reply      The reply packet
- * \param fromaddrp  Our from address
- * \param fromlen    Length of our from address
- */
-void mk_reply( e_socks_buffer_t *inbuf, int rsize, char *reply, struct sockaddr_in *fromaddrp, int fromlen) {
-  e_reply_queue_t *our_reply;
-  e_reply_queue_t *last_reply;		// points to the last reply in the queue
-
-  our_reply = calloc( sizeof( *our_reply), 1);
-  if( our_reply == NULL) {
-    fprintf( stderr, "Out of memory for our_reply (mk_reply)\n");
-    exit( -1);
-  }
-  our_reply->next         = NULL;
-  our_reply->reply_size   = rsize;
-  our_reply->reply_packet = reply;
-
-  our_reply->fromlen      = fromlen;
-  if( fromlen > 0) {
-    our_reply->fromaddr   = *fromaddrp;
-  }
-
-  //
-  // Add reply to the end of the queue
-  // We'd support packet priorities here, I suppose
-  //
-  if( inbuf->reply_q == NULL)
-    inbuf->reply_q = our_reply;
-  else {
-    for( last_reply=inbuf->reply_q; last_reply->next != NULL; last_reply=last_reply->next);
-    last_reply->next = our_reply;
-  }
-}
 
 /** Channel Access packet service routine
  *
@@ -2733,8 +2906,7 @@ e_kvpair_t *related_kvpair( e_kvpair_t *parent, char *related) {
 }
 
 void update_ht() {
-  static int kv_name_col, kv_value_col, kv_seq_col, kv_dbr_col, kv_epoch_secs_col, kv_epoch_nsecs_col, first_time=1;
-  e_response_t ert;
+  static int kv_key_col, kv_name_col, kv_value_col, kv_seq_col, kv_dbr_col, kv_epoch_secs_col, kv_epoch_nsecs_col, first_time=1;
   void *params[1];
   int param_lengths[1];
   int param_formats[1];
@@ -2744,10 +2916,6 @@ void update_ht() {
   int i;
   e_kvpair_t *kvpp, *array_length_kvpp;
   e_array_t  *an_array;
-  e_channel_t *chans;
-  e_subscription_t *subs;
-  int struct_size, data_size;
-  void *payload;
 
   nseq = htonl( ht_seq);
   params[0] = &nseq;	param_lengths[0] = sizeof(nseq);	param_formats[0] = 1;
@@ -2759,6 +2927,7 @@ void update_ht() {
   }
 
   if( first_time) {
+    kv_key_col         = PQfnumber( pgr, "kv_key");
     kv_name_col        = PQfnumber( pgr, "kv_name");
     kv_value_col       = PQfnumber( pgr, "kv_value");
     kv_seq_col         = PQfnumber( pgr, "kv_seq");
@@ -2793,33 +2962,7 @@ void update_ht() {
 	kvpp->eepoch_secs    = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_secs_col));
 	kvpp->eepoch_nsecs   = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_epoch_nsecs_col));
 
-	//
-	// Notify the subscribers
-	//
-	for( chans = kvpp->chans; chans != NULL; chans = chans->next) {
-	  for( subs = chans->subs; subs != NULL; subs = subs->next) {
-	    //
-	    // create a message
-
-	    struct_size = dbr_sizes[subs->dtype].dbr_struct_size;
-	    data_size   = dbr_sizes[subs->dtype].dbr_type_size;
-	    if( data_size == 0)
-	      data_size = strlen( kvpp->kvvalue)+1;
-
-	    payload = create_message( &ert, 1, struct_size + data_size, subs->dtype, 1, 1, subs->subid);
-	    // struct filling would go here if we did it
-	    mk_dbr_struct( payload, subs->dtype, kvpp->eepoch_secs, kvpp->eepoch_nsecs, "0", "0", 0, 0, 0);
-	    payload += struct_size;
-	    pack_dbr_data( payload, subs->dtype, kvpp->kvvalue);
-
-	    //    fprintf( stderr, "update_ht hex_dump:\n");
-	    //    hex_dump( ert.bufsize, ert.buf);
-
-	    if( ert.buf != NULL && ert.bufsize > 0) {
-	      mk_reply( find_e_socks_buffer( chans->sock), ert.bufsize, ert.buf, NULL, 0);
-	    }
-	  }
-	}
+	notify_subscribers( kvpp);
       }
     } else {
       //
@@ -2831,6 +2974,7 @@ void update_ht() {
 	fprintf( stderr, "update_ht: out of memory\n");
 	exit( 1);
       }
+      kvpp->kvkey          = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_key_col));
       kvpp->kvname         = strdup( PQgetvalue( pgr, i, kv_name_col));
       kvpp->kvvalue        = strdup( PQgetvalue( pgr, i, kv_value_col));
       kvpp->dbr_type       = ntohl( *(uint32_t *)PQgetvalue( pgr, i, kv_dbr_col));

@@ -122,6 +122,7 @@ typedef struct e_array_struct {
 
 typedef struct e_kvpair_struct {
   struct e_kvpair_struct *next;			// the next in the list
+  uint32_t kvkey;				// the
   char *kvname;					// our name
   char *sid_key;				// our alternate key
   char *kvvalue;				// our value
