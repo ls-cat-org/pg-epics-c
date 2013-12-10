@@ -14,6 +14,7 @@ e_socks_buffer_t e_sock_bufs[1024];				//!< read buffer to support these sockets
 int n_e_socks = 0;						//!< current number of sockets
 int n_e_socks_max = sizeof( e_socks)/sizeof( e_socks[0]);	//!< maximum number of sockets
 int e_max_socket_number = 0;					//!< used to shorten filling of e_socks
+int e_min_socket_number = -1;					//!< used to shorten filling of e_socks
 
 static int beacons;						//!< our beacon socket
 static struct sockaddr_in broadcastaddr, ouraddr;		//!< addresses for broadcasts and listening
@@ -90,7 +91,7 @@ e_socks_buffer_t *find_e_socks_buffer( int sock) {
     if( e_sock_bufs[buf_index].sock == sock)
       break;
   }
-  if( i > n_e_socks_max) {
+  if( i == n_e_socks_max) {
     fprintf( stderr, "find_e_socks_buffer: could not find buffer for socket %d\n", sock);
     return NULL;
   }
@@ -213,6 +214,7 @@ int e_socks_buf_init( int sock) {
   e_sock_bufs[j].reply_q   = NULL;
 
   e_max_socket_number = e_max_socket_number < sock ? sock : e_max_socket_number;
+  e_min_socket_number = e_min_socket_number == -1  ? sock : (e_min_socket_number > sock ? sock : e_min_socket_number);
 
   return j;
 }
@@ -221,15 +223,17 @@ int e_socks_buf_init( int sock) {
  */
 void e_socks_buf_close( e_socks_buffer_t *esb) {
   int i;
+  int sock;
 
   esb->active  = 0;
 
-  if( e_max_socket_number <= esb->sock) {
-    e_max_socket_number = 0;
-    for( i=0; i<n_e_socks_max; i++) {
-      if( e_sock_bufs[i].active != 0 )
-	  if( e_sock_bufs[i].sock > e_max_socket_number)
-	    e_max_socket_number = e_sock_bufs[i].sock;
+  e_max_socket_number = 0;
+  e_min_socket_number = -1;
+  for( i=0; i<n_e_socks_max; i++) {
+    if( e_sock_bufs[i].active != 0 ) {
+      sock = e_sock_bufs[i].sock;
+      e_max_socket_number = e_max_socket_number < sock ? sock : e_max_socket_number;
+      e_min_socket_number = e_min_socket_number == -1  ? sock : (e_min_socket_number > sock ? sock : e_min_socket_number);
     }
   }
 
@@ -1534,6 +1538,8 @@ void cmd_ca_proto_event_cancel( e_socks_buffer_t *inbuf, e_response_t *r) {
   sid   = inbuf->emh.p1;
   subid = inbuf->emh.p2;
 
+  fprintf( stderr, "cmd_ca_proto_event_cancel: sid=%d subid=%d  sock=%d\n", sid, subid, inbuf->sock);
+
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
   entry_outp = hsearch( entry_in, FIND);
@@ -1882,7 +1888,7 @@ void cmd_ca_proto_build( e_socks_buffer_t *inbuf, e_response_t *r) {
  */
 void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->events_on = 0;
-  //  printf( "Events off\n");
+  fprintf( stderr, "cmd_ca_proto_events_off: sock=%d\n", inbuf->sock);
 }
 
 
@@ -1899,7 +1905,7 @@ void cmd_ca_proto_events_off( e_socks_buffer_t *inbuf, e_response_t *r) {
  */
 void cmd_ca_proto_events_on( e_socks_buffer_t *inbuf, e_response_t *r) {
   inbuf->events_on = 1;
-  //  printf( "Events on\n");
+  fprintf( stderr, "cmd_ca_proto_events_on: sock=%d\n", inbuf->sock);
 }
 
 /** Deprecated and un documented
@@ -1927,7 +1933,7 @@ void cmd_ca_proto_read_sync( e_socks_buffer_t *inbuf, e_response_t *r) {
  * UNIMPLIMENTED
  */
 void cmd_ca_proto_error( e_socks_buffer_t *inbuf, e_response_t *r) {
-  //  printf( "Proto Error\n");
+  fprintf( stderr, "cmd_ca_proto_error: sock=%d\n", inbuf->sock);
 }
 
 /** Clears the channel (shuts it down)
@@ -1952,11 +1958,15 @@ void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
   sid = inbuf->emh.p1;
   cid = inbuf->emh.p2;
 
+  fprintf( stderr, "cmd_ca_proto_clear_channel: sid=%d  cid=%d  sock=%d\n",  sid, cid, inbuf->sock);
+
   sprintf( sid_key, "%08x", sid);
   entry_in.key = sid_key;
   entry_outp = hsearch( entry_in, FIND);
-  if( entry_outp == NULL || entry_outp->data == NULL)
+  if( entry_outp == NULL || entry_outp->data == NULL) {
+    fprintf( stderr, "cmd_ca_proto_clear_channel: sid %d not found\n", sid);
     return;
+  }
 
   kvpp = entry_outp->data;
 
@@ -2007,6 +2017,7 @@ void cmd_ca_proto_clear_channel( e_socks_buffer_t *inbuf, e_response_t *r) {
 
   create_message( r, 12, 0, 0, 0, sid, cid);
   inbuf->active--;
+  fprintf( stderr, "cmd_ca_proto_clear_channel: active is now %d\n", inbuf->active);
 }
 
 /** Beacon sent by server when it becomes available
@@ -2430,7 +2441,7 @@ void cmd_ca_proto_signal( e_socks_buffer_t *inbuf, e_response_t *r) {
  * TODO: Implement when we need to act as a client.
  */
 void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
-  //  printf( "Create ch fail\n");
+  fprintf( stderr, "cmd_ca_proto_create_ch_fail: Create Channel Failure\n");
 }
 
 /** Notifies client that server has disconnected the channel
@@ -2447,7 +2458,7 @@ void cmd_ca_proto_create_ch_fail( e_socks_buffer_t *inbuf, e_response_t *r) {
  * TODO: Implement when we need to act as a client
  */
 void cmd_ca_proto_server_disconn( e_socks_buffer_t *inbuf, e_response_t *r) {
-  //  printf( "Server Disconnect\n");
+  fprintf( stderr, "cmd_ca_proto_create_ch_disconn: Server Disconnect\n");
 }
 
 
@@ -2614,7 +2625,11 @@ void ca_service( struct pollfd *pfd) {
     }
   }
 
-  if( inbuf->active != 0 && (pfd->revents & POLLIN) != 0) {
+  if( (pfd->revents & POLLIN) != 0) {
+    if( inbuf->active == 0) {
+      e_socks_buf_close( inbuf);
+      return;
+    }
 
     fixup_bps( inbuf);
 
@@ -3066,6 +3081,8 @@ int main( int argc, char **argv) {
   }
 
   e_socks_buf_init( sock);
+  fprintf( stderr, "main: udp listening socket is %d\n", sock);
+
 
   beacons = socket( PF_INET, SOCK_DGRAM, 0);
   if( sock == -1) {
@@ -3102,6 +3119,7 @@ int main( int argc, char **argv) {
   inet_aton( E_LISTEN_IP, &(ouraddr.sin_addr));
 
   beacon_index = e_socks_buf_init( beacons);
+  fprintf( stderr, "main: beacon socket is %d\n", beacons);
 
   //
   // TCP Virtual Circuits
@@ -3141,6 +3159,7 @@ int main( int argc, char **argv) {
   }
   
   e_socks_buf_init( vclistener);
+  fprintf( stderr, "main: vc tcp listening socket is %d\n", vclistener);
 
   //
   // block sigalrm
@@ -3177,12 +3196,18 @@ int main( int argc, char **argv) {
     //
     // Fill up the fd array
     // Ignore stdin, stdout, stderr
-    for( i=0, sock=3; sock<=e_max_socket_number; sock++) {
+    for( i=0, sock=e_min_socket_number; sock<=e_max_socket_number; sock++) {
       e_socks_buffer_t *sbuff;
 
       sbuff = find_e_socks_buffer( sock);
       if( sbuff == NULL)
 	continue;
+
+      if( sbuff->active == 0) {
+	if( sbuff->sock != -1)
+	  e_socks_buf_close( sbuff);
+	continue;
+      }
 
       e_socks[i].fd = sock;
       e_socks[i].events = POLLIN;
