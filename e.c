@@ -152,7 +152,7 @@ void pg_conn() {
     //
     // make a new conneciton
     //
-    q = PQconnectdb( "dbname=ls user=lsuser host=10.1.0.3");
+    q = PQconnectdb( "dbname=ls user=lsuser host=postgres.ls-cat.net");
     if( PQstatus(q) != CONNECTION_OK) {
       fprintf( stderr, "Failed to connect to contrabass (pg_conn)\n");
       q = NULL;
